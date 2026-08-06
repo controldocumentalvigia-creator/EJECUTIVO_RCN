@@ -1,0 +1,27 @@
+{
+  "version": "V8",
+  "syntax_ok": true,
+  "operational_sheet": "CRUCE_DATA_PAT",
+  "financial_sheet_tested": "CONSOLIDADO_ASTRANS",
+  "operational_rows": 1486,
+  "financial_rows": 3800,
+  "detailed_states": {
+    "Programado por Proveedor": 1146,
+    "Re-Programado": 222,
+    "Cancelada por Solicitante": 91,
+    "Cancelado": 16,
+    "nan": 6,
+    "Programado": 2,
+    "Programado RCN": 2,
+    "Programado ": 1
+  },
+  "grouped_states": {
+    "PROGRAMADO": 1373,
+    "CANCELADO": 107,
+    "OTRO": 6
+  },
+  "required_financial_columns": {
+    "V.CLIENTE": true,
+    "V.CONDUCT": true
+  }
+}
