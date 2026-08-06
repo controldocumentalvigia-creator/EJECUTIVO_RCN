@@ -454,14 +454,29 @@ resultado_col = buscar_columna(
 with st.sidebar:
     st.header("🔎 Filtros del informe")
 
-    meses_disponibles = sorted(
-        set(operativo["AÑO_MES"].dropna().unique())
-        | set(financiero["AÑO_MES"].dropna().unique())
+    meses_operativos = set(
+        operativo["AÑO_MES"].dropna().astype(str).unique()
     )
+    meses_financieros = set(
+        financiero["AÑO_MES"].dropna().astype(str).unique()
+    )
+    meses_disponibles = sorted(
+        meses_operativos & meses_financieros
+    )
+
+    if not meses_disponibles:
+        meses_disponibles = sorted(
+            meses_operativos | meses_financieros
+        )
+
     meses = st.multiselect(
         "Meses",
         meses_disponibles,
         default=meses_disponibles,
+        help=(
+            "Por defecto se muestran únicamente los meses presentes "
+            "simultáneamente en CRUCE_DATA_PAT y BASE_MAESTRA_RCN."
+        ),
     )
 
     periodicidades = {
@@ -560,18 +575,36 @@ operativo_periodo["ACUMULADO"] = operativo_periodo["SERVICIOS"].cumsum()
 detalle_res = resumen_categoria(operativo_f, "PAT_ESTADO_DETALLE")
 agrupado_res = resumen_categoria(operativo_f, "PAT_ESTADO_AGRUPADO")
 
-programados = int(
+total_servicios = int(len(operativo_f))
+
+total_programados = int(
     (operativo_f["PAT_ESTADO_AGRUPADO"] == "PROGRAMADO").sum()
 )
-cancelados = int(
+total_cancelados = int(
     (operativo_f["PAT_ESTADO_AGRUPADO"] == "CANCELADO").sum()
 )
-otros = int(
-    (operativo_f["PAT_ESTADO_AGRUPADO"] == "OTRO").sum()
+total_otros = int(
+    total_servicios - total_programados - total_cancelados
 )
-total_operativo = len(operativo_f)
-pct_programado = programados / total_operativo * 100 if total_operativo else 0
-pct_cancelado = cancelados / total_operativo * 100 if total_operativo else 0
+
+pct_programados = (
+    total_programados / total_servicios * 100
+    if total_servicios
+    else 0
+)
+pct_cancelados = (
+    total_cancelados / total_servicios * 100
+    if total_servicios
+    else 0
+)
+
+# Alias internos para conservar compatibilidad con el resto del dashboard.
+programados = total_programados
+cancelados = total_cancelados
+otros = total_otros
+total_operativo = total_servicios
+pct_programado = pct_programados
+pct_cancelado = pct_cancelados
 
 fin_periodo = (
     financiero_f.groupby(periodo_col, as_index=False)
@@ -591,11 +624,31 @@ fin_periodo["RENTABILIDAD_%"] = np.where(
 fin_periodo["VAR_FACTURACION_%"] = fin_periodo["FACTURACION"].pct_change() * 100
 fin_periodo["VAR_SERVICIOS_%"] = fin_periodo["SERVICIOS"].pct_change() * 100
 
-facturacion = financiero_f["FACTURACION_NUM"].sum()
-costos = financiero_f["COSTO_NUM"].sum()
+facturacion = float(financiero_f["FACTURACION_NUM"].sum())
+costos = float(financiero_f["COSTO_NUM"].sum())
 margen = facturacion - costos
 rentabilidad = margen / facturacion * 100 if facturacion else 0
-ticket = facturacion / len(financiero_f) if len(financiero_f) else 0
+
+remesa_col = buscar_columna(
+    financiero_f,
+    ["ASTRANS_REMESA_NORM", "REMESA"],
+)
+if remesa_col:
+    servicios_ejecutados = int(
+        financiero_f[remesa_col]
+        .replace("", np.nan)
+        .dropna()
+        .astype(str)
+        .nunique()
+    )
+else:
+    servicios_ejecutados = int(len(financiero_f))
+
+ticket = (
+    facturacion / servicios_ejecutados
+    if servicios_ejecutados
+    else 0
+)
 
 
 # ============================================================
@@ -619,29 +672,35 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Resumen Ejecutivo RCN")
 
+    st.markdown("### Resumen operativo")
     cols = st.columns(6)
     with cols[0]:
-        kpi("Solicitudes operativas", entero(total_operativo))
+        kpi("Total servicios", entero(total_servicios), "CRUCE_DATA_PAT")
     with cols[1]:
-        kpi("Programados", entero(programados), porcentaje(pct_programado))
+        kpi("Total programados", entero(total_programados), porcentaje(pct_programados))
     with cols[2]:
-        kpi("Cancelados", entero(cancelados), porcentaje(pct_cancelado))
+        kpi("Total cancelados", entero(total_cancelados), porcentaje(pct_cancelados))
     with cols[3]:
-        kpi("Servicios ejecutados", entero(len(financiero_f)))
+        kpi("% programados", porcentaje(pct_programados))
     with cols[4]:
-        kpi("Facturación", moneda(facturacion))
+        kpi("% cancelados", porcentaje(pct_cancelados))
     with cols[5]:
-        kpi("Rentabilidad", porcentaje(rentabilidad))
+        kpi("Promedio diario", f"{promedio_diario:.1f}")
 
-    cols2 = st.columns(4)
+    st.markdown("### Resumen financiero")
+    cols2 = st.columns(6)
     with cols2[0]:
-        kpi("Costos", moneda(costos))
+        kpi("Servicios ejecutados", entero(servicios_ejecutados), "Remesas únicas")
     with cols2[1]:
-        kpi("Margen", moneda(margen))
+        kpi("Facturación", moneda(facturacion))
     with cols2[2]:
-        kpi("Ticket promedio", moneda(ticket))
+        kpi("Costos", moneda(costos))
     with cols2[3]:
-        kpi("Otros estados", entero(otros))
+        kpi("Margen", moneda(margen))
+    with cols2[4]:
+        kpi("Rentabilidad", porcentaje(rentabilidad))
+    with cols2[5]:
+        kpi("Ticket promedio", moneda(ticket))
 
     c1, c2 = st.columns(2)
     with c1:
@@ -701,7 +760,7 @@ with tabs[0]:
         )
 
     st.write(
-        f"La base financiera registra **{entero(len(financiero_f))} servicios ejecutados**, "
+        f"La base financiera registra **{entero(servicios_ejecutados)} remesas únicas ejecutadas**, "
         f"una facturación de **{moneda(facturacion)}**, costos por **{moneda(costos)}** y un margen de "
         f"**{moneda(margen)}**, equivalente a una rentabilidad de **{porcentaje(rentabilidad)}**. "
         f"Esta separación permite analizar la programación desde CRUCE_DATA_PAT y el resultado económico "
@@ -1277,7 +1336,7 @@ with tabs[10]:
         f"**{entero(programados)} fueron programadas ({porcentaje(pct_programado)})** y "
         f"**{entero(cancelados)} canceladas ({porcentaje(pct_cancelado)})**. "
         f"El análisis financiero se construyó sobre **{hoja_financiera}**, con "
-        f"**{entero(len(financiero_f))} servicios ejecutados**, facturación de "
+        f"**{entero(servicios_ejecutados)} remesas únicas ejecutadas**, facturación de "
         f"**{moneda(facturacion)}**, margen de **{moneda(margen)}** y rentabilidad de "
         f"**{porcentaje(rentabilidad)}**."
     )
