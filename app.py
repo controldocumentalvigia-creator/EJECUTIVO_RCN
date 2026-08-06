@@ -167,57 +167,18 @@ def agregar_periodos(df, fecha_col):
     return temp
 
 
-def limpiar_categoria(serie: pd.Series) -> pd.Series:
-    texto = serie.astype("string").str.strip()
-
-    nulos = {
-        "",
-        "NAN",
-        "NONE",
-        "NULL",
-        "<NA>",
-        "N/A",
-        "NA",
-        "SIN DATO",
-        "NO APLICA",
-    }
-
-    mascara_nulo = (
-        texto.isna()
-        | texto.str.upper().isin(nulos)
-    )
-
-    return texto.mask(mascara_nulo, pd.NA)
-
-
 def resumen_categoria(df, columna):
     if not columna or columna not in df.columns or df.empty:
-        return pd.DataFrame(
-            columns=[columna or "CATEGORIA", "CANTIDAD", "PARTICIPACION_%"]
-        )
-
-    temp = df[[columna]].copy()
-    temp[columna] = limpiar_categoria(temp[columna])
-    temp = temp.dropna(subset=[columna])
-
-    if temp.empty:
-        return pd.DataFrame(
-            columns=[columna, "CANTIDAD", "PARTICIPACION_%"]
-        )
+        return pd.DataFrame(columns=[columna or "CATEGORIA", "CANTIDAD", "PARTICIPACION_%"])
 
     out = (
-        temp.groupby(columna, dropna=False)
+        df.groupby(columna, dropna=False)
         .size()
         .reset_index(name="CANTIDAD")
         .sort_values("CANTIDAD", ascending=False)
     )
-
     total = out["CANTIDAD"].sum()
-    out["PARTICIPACION_%"] = (
-        out["CANTIDAD"] / total * 100
-        if total
-        else 0
-    )
+    out["PARTICIPACION_%"] = out["CANTIDAD"] / total * 100 if total else 0
     return out
 
 
@@ -1250,307 +1211,164 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("Centro / Orden de Costo")
 
-    # Esta sección conserva las dos visuales:
-    # 1. Pareto
-    # 2. Evolución mensual del Top 5
-    #
-    # Para la evolución se prioriza CRUCE_DATA_PAT, porque allí se conserva
-    # el histórico operativo completo de DATA y todos los meses seleccionados.
+    # Esta sección es OPERATIVA y debe salir de CRUCE_DATA_PAT.
+    # Así conserva todos los meses de DATA, incluso cuando PAT o ASTRANS
+    # no tengan información completa en los primeros meses.
+    centro_col = op_centro_col
 
-    centro_col = op_centro_col or fin_centro_col
-
-    if centro_col:
-        fuente_centro = (
-            operativo_f
-            if centro_col in operativo_f.columns
-            else financiero_f
+    if not centro_col:
+        st.warning(
+            "CRUCE_DATA_PAT no contiene una columna válida de Centro / Orden de Costo."
+        )
+    else:
+        st.caption(
+            "Fuente: CRUCE_DATA_PAT. La evolución usa todos los meses disponibles "
+            "en DATA dentro del período seleccionado."
         )
 
-        # ----------------------------------------------------
-        # 1. Pareto Centro / Orden de Costo
-        # ----------------------------------------------------
+        # Top 5 calculado sobre todo el período operativo filtrado.
+        ranking_centros = (
+            operativo_f.groupby(centro_col, dropna=False)
+            .size()
+            .reset_index(name="TOTAL_SERVICIOS")
+            .sort_values("TOTAL_SERVICIOS", ascending=False)
+        )
+        top_centros = ranking_centros.head(5)[centro_col].tolist()
+
         st.plotly_chart(
             pareto(
-                fuente_centro,
+                operativo_f,
                 centro_col,
                 "Pareto Centro / Orden Costo",
             ),
             use_container_width=True,
         )
 
-        # ----------------------------------------------------
-        # 2. Evolución mensual Top 5
-        # ----------------------------------------------------
-        ranking_centros = resumen_categoria(
-            fuente_centro,
-            centro_col,
-        )
-
-        top_centros = (
-            ranking_centros
-            .head(5)[centro_col]
-            .astype(str)
-            .tolist()
-        )
-
-        meses_ordenados = sorted(
-            fuente_centro["AÑO_MES"]
+        # Construir una malla completa Mes x Centro para mostrar todo el semestre.
+        meses_evolucion = sorted(
+            operativo_f["AÑO_MES"]
             .dropna()
             .astype(str)
             .loc[lambda s: s.ne("NaT")]
             .unique()
         )
 
-        evol = (
-            fuente_centro[
-                fuente_centro[centro_col]
-                .astype(str)
-                .isin(top_centros)
+        base_evolucion = (
+            operativo_f[
+                operativo_f[centro_col].isin(top_centros)
             ]
-            .groupby(
-                ["AÑO_MES", centro_col],
-                as_index=False,
-            )
+            .groupby(["AÑO_MES", centro_col], as_index=False)
             .size()
             .rename(columns={"size": "SERVICIOS"})
         )
 
-        # Completar meses faltantes con cero para que cada centro
-        # aparezca a lo largo de todo el periodo seleccionado.
-        indice_completo = pd.MultiIndex.from_product(
-            [meses_ordenados, top_centros],
+        malla = pd.MultiIndex.from_product(
+            [meses_evolucion, top_centros],
             names=["AÑO_MES", centro_col],
-        )
+        ).to_frame(index=False)
 
-        evol = (
-            evol.set_index(["AÑO_MES", centro_col])
-            .reindex(indice_completo, fill_value=0)
-            .reset_index()
+        evolucion = (
+            malla.merge(
+                base_evolucion,
+                on=["AÑO_MES", centro_col],
+                how="left",
+            )
+            .fillna({"SERVICIOS": 0})
         )
+        evolucion["SERVICIOS"] = evolucion["SERVICIOS"].astype(int)
 
         fig = px.line(
-            evol,
+            evolucion,
             x="AÑO_MES",
             y="SERVICIOS",
             color=centro_col,
             markers=True,
             text="SERVICIOS",
-            category_orders={
-                "AÑO_MES": meses_ordenados,
-                centro_col: top_centros,
-            },
+            category_orders={"AÑO_MES": meses_evolucion},
         )
-
         fig.update_traces(
             textposition="top center",
             connectgaps=True,
         )
-
-        fig.update_layout(
-            legend_title_text="CENTRO / ORDEN DE COSTO",
-            hovermode="x unified",
+        fig.update_xaxes(
+            type="category",
+            categoryorder="array",
+            categoryarray=meses_evolucion,
         )
 
         st.plotly_chart(
             aplicar_estilo(
                 fig,
                 "Evolución mensual top eventos / centros de costo",
-                560,
+                540,
             ),
             use_container_width=True,
         )
 
-        # ----------------------------------------------------
-        # 3. Tabla de variación mensual del Top 5
-        # ----------------------------------------------------
-        tabla_evol = evol.pivot_table(
-            index=centro_col,
-            columns="AÑO_MES",
-            values="SERVICIOS",
-            fill_value=0,
-        )
-
-        tabla_evol = tabla_evol.reindex(
-            index=top_centros,
-            columns=meses_ordenados,
-            fill_value=0,
-        )
-
-        if len(meses_ordenados) >= 2:
-            mes_actual = meses_ordenados[-1]
-            mes_anterior = meses_ordenados[-2]
-
-            tabla_var = pd.DataFrame({
-                centro_col: tabla_evol.index,
-                f"SERVICIOS_{mes_anterior}": tabla_evol[mes_anterior].values,
-                f"SERVICIOS_{mes_actual}": tabla_evol[mes_actual].values,
-            })
-
-            anterior = tabla_var[f"SERVICIOS_{mes_anterior}"]
-            actual = tabla_var[f"SERVICIOS_{mes_actual}"]
-
-            tabla_var["VARIACION_%"] = np.where(
-                anterior != 0,
-                (actual / anterior - 1) * 100,
-                np.where(actual > 0, 100, 0),
-            )
-
-            tabla_var["TENDENCIA"] = np.select(
-                [
-                    tabla_var["VARIACION_%"] > 0,
-                    tabla_var["VARIACION_%"] < 0,
-                ],
-                [
-                    "▲ SUBE",
-                    "▼ BAJA",
-                ],
-                default="▬ ESTABLE",
-            )
-
-            tabla_mostrar = tabla_var.copy()
-            tabla_mostrar["VARIACION_%"] = (
-                tabla_mostrar["VARIACION_%"]
-                .apply(porcentaje)
-            )
-
-            st.markdown(
-                f"### Variación del Top 5: {mes_anterior} vs {mes_actual}"
-            )
-            st.dataframe(
-                tabla_mostrar,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            # ------------------------------------------------
-            # 4. Análisis ejecutivo automático
-            # ------------------------------------------------
-            mayor_actual = tabla_var.loc[
-                tabla_var[f"SERVICIOS_{mes_actual}"].idxmax()
-            ]
-            mayor_crecimiento = tabla_var.loc[
-                tabla_var["VARIACION_%"].idxmax()
-            ]
-            mayor_caida = tabla_var.loc[
-                tabla_var["VARIACION_%"].idxmin()
-            ]
-
-            texto_caida = (
-                f"Por otra parte, **{mayor_caida[centro_col]}** presentó "
-                f"la mayor disminución, con una variación de "
-                f"**{porcentaje(mayor_caida['VARIACION_%'])}**."
-                if mayor_caida["VARIACION_%"] < 0
-                else "No se identificaron disminuciones entre los centros analizados."
-            )
-
-            st.markdown("### Análisis ejecutivo")
-            st.write(
-                f"En **{mes_actual}**, el centro de costo con mayor volumen fue "
-                f"**{mayor_actual[centro_col]}**, con "
-                f"**{entero(mayor_actual[f'SERVICIOS_{mes_actual}'])} servicios**. "
-                f"El mayor crecimiento frente a **{mes_anterior}** se registró en "
-                f"**{mayor_crecimiento[centro_col]}**, con una variación de "
-                f"**{porcentaje(mayor_crecimiento['VARIACION_%'])}**. "
-                f"{texto_caida} "
-                f"Este comportamiento evidencia cambios en la distribución de la demanda "
-                f"entre producciones y permite priorizar capacidad operativa en los eventos "
-                f"con mayor crecimiento."
-            )
-        else:
-            st.info(
-                "Para calcular variaciones por centro de costo se requieren "
-                "al menos dos meses seleccionados."
-            )
-    else:
-        st.warning(
-            "No se encontró una columna de Centro / Orden de Costo "
-            "en CRUCE_DATA_PAT ni en BASE_MAESTRA_RCN."
+        st.info(
+            "La gráfica mantiene el eje completo desde el primer hasta el último "
+            "mes seleccionado. Cuando un centro no tiene servicios en un mes, "
+            "se muestra con valor 0 para conservar la continuidad del semestre."
         )
 
 
 with tabs[7]:
     st.subheader("Tipo de vehículo y modalidad")
 
-    st.caption(
-        "Estas participaciones se calculan desde CRUCE_DATA_PAT, "
-        "porque allí se conserva el histórico operativo completo de DATA."
-    )
-
-    fuente_vehiculo = operativo_f
-    columna_vehiculo = op_vehiculo_col
-
-    fuente_modalidad = operativo_f
-    columna_modalidad = op_modalidad_col
-
     c1, c2 = st.columns(2)
-
     with c1:
-        if columna_vehiculo:
-            veh_validos = limpiar_categoria(
-                fuente_vehiculo[columna_vehiculo]
-            ).notna().sum()
-
+        if fin_vehiculo_col:
             st.plotly_chart(
                 dona(
-                    fuente_vehiculo,
-                    columna_vehiculo,
+                    financiero_f,
+                    fin_vehiculo_col,
                     "Participación por tipo de vehículo",
                 ),
                 use_container_width=True,
             )
-            st.caption(
-                f"Registros válidos analizados: {entero(veh_validos)}"
-            )
-        else:
-            st.warning(
-                "No se encontró la columna de tipo de vehículo "
-                "en CRUCE_DATA_PAT."
+        elif op_vehiculo_col:
+            st.plotly_chart(
+                dona(
+                    operativo_f,
+                    op_vehiculo_col,
+                    "Participación por tipo de vehículo",
+                ),
+                use_container_width=True,
             )
 
     with c2:
-        if columna_modalidad:
-            mod_validos = limpiar_categoria(
-                fuente_modalidad[columna_modalidad]
-            ).notna().sum()
-
+        if fin_modalidad_col:
             st.plotly_chart(
                 dona(
-                    fuente_modalidad,
-                    columna_modalidad,
+                    financiero_f,
+                    fin_modalidad_col,
                     "Participación por modalidad",
                 ),
                 use_container_width=True,
             )
-            st.caption(
-                f"Registros válidos analizados: {entero(mod_validos)}"
-            )
-        else:
-            st.warning(
-                "No se encontró la columna de modalidad "
-                "en CRUCE_DATA_PAT."
+        elif op_modalidad_col:
+            st.plotly_chart(
+                dona(
+                    operativo_f,
+                    op_modalidad_col,
+                    "Participación por modalidad",
+                ),
+                use_container_width=True,
             )
 
 
 with tabs[8]:
     st.subheader("Origen y destino")
 
-    st.caption(
-        "Se muestran dos lecturas complementarias: "
-        "matriz Origen → Destino y evolución mensual por ciudad de origen."
+    origen_col = fin_origen_col or op_origen_col
+    destino_col = fin_destino_col or op_destino_col
+    fuente_od = (
+        financiero_f
+        if origen_col in financiero_f.columns
+        else operativo_f
     )
 
-    # Para el análisis geográfico priorizamos CRUCE_DATA_PAT,
-    # porque conserva el histórico operativo completo de DATA.
-    origen_col = op_origen_col or fin_origen_col
-    destino_col = op_destino_col or fin_destino_col
-    fuente_od = operativo_f if origen_col in operativo_f.columns else financiero_f
-
     if origen_col and destino_col:
-        c1, c2 = st.columns(2)
-
-        # ====================================================
-        # 1. Mapa de calor Origen → Destino
-        # ====================================================
         od = (
             fuente_od.groupby(
                 [origen_col, destino_col],
@@ -1569,157 +1387,35 @@ with tabs[8]:
         top_d = (
             od.groupby(destino_col)["SERVICIOS"]
             .sum()
-            .nlargest(12)
+            .nlargest(10)
             .index
         )
 
-        od_filtrado = od[
+        od = od[
             od[origen_col].isin(top_o)
             & od[destino_col].isin(top_d)
         ]
 
-        pivot_od = od_filtrado.pivot_table(
+        pivot = od.pivot_table(
             index=origen_col,
             columns=destino_col,
             values="SERVICIOS",
             fill_value=0,
         )
 
-        with c1:
-            fig_od = px.imshow(
-                pivot_od,
-                text_auto=True,
-                aspect="auto",
-                color_continuous_scale="YlOrRd",
-            )
-            fig_od.update_layout(
-                coloraxis_colorbar=dict(title="Servicios")
-            )
-            st.plotly_chart(
-                aplicar_estilo(
-                    fig_od,
-                    "Mapa de calor Origen → Destino",
-                    560,
-                ),
-                use_container_width=True,
-            )
-
-        # ====================================================
-        # 2. Mapa de calor: servicios por ciudad origen y mes
-        # ====================================================
-        origen_mes = (
-            operativo_f.groupby(
-                [op_origen_col, "AÑO_MES"],
-                as_index=False,
-            )
-            .size()
-            .rename(columns={"size": "SERVICIOS"})
+        fig = px.imshow(
+            pivot,
+            text_auto=True,
+            aspect="auto",
+            color_continuous_scale="Blues",
         )
-
-        top_origen_mes = (
-            origen_mes.groupby(op_origen_col)["SERVICIOS"]
-            .sum()
-            .nlargest(10)
-            .index
-        )
-
-        origen_mes = origen_mes[
-            origen_mes[op_origen_col].isin(top_origen_mes)
-        ].copy()
-
-        pivot_mes = origen_mes.pivot_table(
-            index=op_origen_col,
-            columns="AÑO_MES",
-            values="SERVICIOS",
-            fill_value=0,
-        )
-
-        # Orden cronológico de meses
-        pivot_mes = pivot_mes.reindex(
-            sorted(pivot_mes.columns),
-            axis=1,
-        )
-
-        with c2:
-            fig_mes = px.imshow(
-                pivot_mes,
-                text_auto=True,
-                aspect="auto",
-                color_continuous_scale="Blues",
-            )
-            fig_mes.update_layout(
-                coloraxis_colorbar=dict(title="Servicios")
-            )
-            st.plotly_chart(
-                aplicar_estilo(
-                    fig_mes,
-                    "Mapa de calor: servicios por ciudad origen y mes",
-                    560,
-                ),
-                use_container_width=True,
-            )
-
-        # ====================================================
-        # 3. Ranking complementario
-        # ====================================================
-        st.markdown("### Ranking geográfico")
-        r1, r2 = st.columns(2)
-
-        with r1:
-            origen_rank = resumen_categoria(
-                operativo_f,
-                op_origen_col,
-            ).head(10)
-
-            fig_origen = px.bar(
-                origen_rank.sort_values("CANTIDAD"),
-                x="CANTIDAD",
-                y=op_origen_col,
-                orientation="h",
-                text="CANTIDAD",
-            )
-            fig_origen.update_traces(
-                marker_color=AZUL,
-                textposition="outside",
-            )
-            st.plotly_chart(
-                aplicar_estilo(
-                    fig_origen,
-                    "Top 10 ciudades de origen",
-                    470,
-                ),
-                use_container_width=True,
-            )
-
-        with r2:
-            destino_rank = resumen_categoria(
-                operativo_f,
-                op_destino_col,
-            ).head(10)
-
-            fig_destino = px.bar(
-                destino_rank.sort_values("CANTIDAD"),
-                x="CANTIDAD",
-                y=op_destino_col,
-                orientation="h",
-                text="CANTIDAD",
-            )
-            fig_destino.update_traces(
-                marker_color=AZUL_MEDIO,
-                textposition="outside",
-            )
-            st.plotly_chart(
-                aplicar_estilo(
-                    fig_destino,
-                    "Top 10 ciudades de destino",
-                    470,
-                ),
-                use_container_width=True,
-            )
-    else:
-        st.warning(
-            "No se encontraron columnas de origen y destino "
-            "en CRUCE_DATA_PAT ni en BASE_MAESTRA_RCN."
+        st.plotly_chart(
+            aplicar_estilo(
+                fig,
+                "Mapa de calor Origen → Destino",
+                520,
+            ),
+            use_container_width=True,
         )
 
 
