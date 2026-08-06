@@ -598,6 +598,19 @@ pct_cancelados = (
     else 0
 )
 
+# Promedio diario calculado con los días únicos del periodo operativo filtrado.
+dias_operativos = int(
+    operativo_f[pat_fecha_col]
+    .dropna()
+    .dt.normalize()
+    .nunique()
+)
+promedio_diario = (
+    total_servicios / dias_operativos
+    if dias_operativos
+    else 0
+)
+
 # Alias internos para conservar compatibilidad con el resto del dashboard.
 programados = total_programados
 cancelados = total_cancelados
