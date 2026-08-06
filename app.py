@@ -1,6 +1,7 @@
 import io
 import re
 import unicodedata
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -192,15 +193,18 @@ def agrupar_estado_pat(valor):
         "CANCELADO": "CANCELADO",
         "PROGRAMADO": "PROGRAMADO",
         "PROGRAMADO RCN": "PROGRAMADO",
+        "LIQUIDADO": "PROGRAMADO",
+        "PRELIQUIDADO": "PROGRAMADO",
     }
 
     if estado in mapa:
         return mapa[estado]
     if "CANCEL" in estado:
         return "CANCELADO"
-    if "PROGRAM" in estado:
-        return "PROGRAMADO"
-    return "OTRO"
+
+    # Todo estado no cancelado representa una solicitud programada
+    # dentro del histórico operativo de DATA.
+    return "PROGRAMADO"
 
 
 def etiqueta_variacion(actual, anterior, tipo="numero"):
@@ -305,7 +309,8 @@ def exportar_excel(hojas: dict[str, pd.DataFrame]) -> bytes:
 # ============================================================
 st.title("📊 RCN Informe Ejecutivo V8")
 st.caption(
-    "Operativo desde CRUCE_DATA_PAT · Financiero desde BASE_MAESTRA_RCN"
+    "Operativo histórico desde DATA en CRUCE_DATA_PAT · "
+    "Financiero desde BASE_MAESTRA_RCN"
 )
 
 archivo = st.file_uploader(
@@ -318,7 +323,10 @@ if not archivo:
     st.stop()
 
 try:
-    xls = pd.ExcelFile(archivo)
+    archivo_bytes = archivo.getvalue()
+    firma_archivo = hashlib.md5(archivo_bytes).hexdigest()[:10]
+
+    xls = pd.ExcelFile(io.BytesIO(archivo_bytes))
 
     if "CRUCE_DATA_PAT" not in xls.sheet_names:
         raise ValueError("El archivo no contiene la hoja CRUCE_DATA_PAT.")
@@ -336,8 +344,8 @@ try:
             "El archivo debe contener BASE_MAESTRA_RCN o CONSOLIDADO_ASTRANS."
         )
 
-    operativo = pd.read_excel(archivo, sheet_name="CRUCE_DATA_PAT")
-    financiero = pd.read_excel(archivo, sheet_name=hoja_financiera)
+    operativo = pd.read_excel(io.BytesIO(archivo_bytes), sheet_name="CRUCE_DATA_PAT")
+    financiero = pd.read_excel(io.BytesIO(archivo_bytes), sheet_name=hoja_financiera)
 
 except Exception as exc:
     st.error(f"No fue posible leer el libro: {exc}")
@@ -347,18 +355,41 @@ except Exception as exc:
 # ============================================================
 # PREPARACIÓN OPERATIVA
 # ============================================================
-pat_fecha_col = buscar_columna(operativo, ["PAT_FECHA_SERVICIO"])
-pat_estado_col = buscar_columna(operativo, ["PAT_ESTADO"])
+operativo_fecha_col = buscar_columna(
+    operativo,
+    ["DATA_FECHA_SERVICIO", "PAT_FECHA_SERVICIO"],
+)
+operativo_estado_col = buscar_columna(
+    operativo,
+    ["DATA_ESTADO_SERVICIO", "PAT_ESTADO"],
+)
 
-if not pat_fecha_col or not pat_estado_col:
+if not operativo_fecha_col or not operativo_estado_col:
     st.error(
-        "CRUCE_DATA_PAT debe contener PAT_FECHA_SERVICIO y PAT_ESTADO."
+        "CRUCE_DATA_PAT debe contener DATA_FECHA_SERVICIO y "
+        "DATA_ESTADO_SERVICIO, o sus equivalentes PAT."
     )
     st.stop()
 
-operativo = agregar_periodos(operativo, pat_fecha_col)
-operativo["PAT_ESTADO_DETALLE"] = operativo[pat_estado_col].fillna("Sin dato").astype(str)
-operativo["PAT_ESTADO_AGRUPADO"] = operativo[pat_estado_col].apply(agrupar_estado_pat)
+operativo = agregar_periodos(
+    operativo,
+    operativo_fecha_col,
+)
+operativo["ESTADO_OPERATIVO_DETALLE"] = (
+    operativo[operativo_estado_col]
+    .fillna("Sin dato")
+    .astype(str)
+)
+operativo["ESTADO_OPERATIVO_AGRUPADO"] = (
+    operativo[operativo_estado_col]
+    .apply(agrupar_estado_pat)
+)
+
+# Alias de compatibilidad para las gráficas existentes.
+pat_fecha_col = operativo_fecha_col
+pat_estado_col = operativo_estado_col
+operativo["PAT_ESTADO_DETALLE"] = operativo["ESTADO_OPERATIVO_DETALLE"]
+operativo["PAT_ESTADO_AGRUPADO"] = operativo["ESTADO_OPERATIVO_AGRUPADO"]
 
 op_centro_col = buscar_columna(
     operativo,
@@ -454,30 +485,54 @@ resultado_col = buscar_columna(
 with st.sidebar:
     st.header("🔎 Filtros del informe")
 
-    meses_operativos = set(
-        operativo["AÑO_MES"].dropna().astype(str).unique()
-    )
-    meses_financieros = set(
-        financiero["AÑO_MES"].dropna().astype(str).unique()
-    )
-    meses_disponibles = sorted(
-        meses_operativos & meses_financieros
+    if st.button(
+        "Restablecer filtros",
+        key=f"reset_{firma_archivo}",
+        use_container_width=True,
+    ):
+        claves_eliminar = [
+            clave
+            for clave in list(st.session_state.keys())
+            if clave.startswith(f"v8_{firma_archivo}_")
+        ]
+        for clave in claves_eliminar:
+            del st.session_state[clave]
+        st.rerun()
+
+    meses_operativos = sorted(
+        operativo["AÑO_MES"]
+        .dropna()
+        .astype(str)
+        .loc[lambda s: s.ne("NaT")]
+        .unique()
     )
 
-    if not meses_disponibles:
-        meses_disponibles = sorted(
-            meses_operativos | meses_financieros
-        )
+    meses_financieros = sorted(
+        financiero["AÑO_MES"]
+        .dropna()
+        .astype(str)
+        .loc[lambda s: s.ne("NaT")]
+        .unique()
+    )
+
+    meses_disponibles = meses_operativos
 
     meses = st.multiselect(
         "Meses",
         meses_disponibles,
         default=meses_disponibles,
+        key=f"v8_{firma_archivo}_meses",
         help=(
-            "Por defecto se muestran únicamente los meses presentes "
-            "simultáneamente en CRUCE_DATA_PAT y BASE_MAESTRA_RCN."
+            "El análisis operativo toma todos los meses disponibles "
+            "en DATA dentro de CRUCE_DATA_PAT."
         ),
     )
+
+    # Si el usuario elimina accidentalmente todos los meses,
+    # se restablece el histórico completo para evitar resultados en cero.
+    if not meses:
+        meses = meses_disponibles
+        st.info("Se aplicaron nuevamente todos los meses disponibles.")
 
     periodicidades = {
         "Mensual": "AÑO_MES",
@@ -488,51 +543,88 @@ with st.sidebar:
     periodicidad_nombre = st.selectbox(
         "Periodicidad",
         list(periodicidades.keys()),
+        key=f"v8_{firma_archivo}_periodicidad",
     )
     periodo_col = periodicidades[periodicidad_nombre]
 
+    estados_detalle_opciones = sorted(
+        x
+        for x in operativo["PAT_ESTADO_DETALLE"]
+        .dropna()
+        .astype(str)
+        .unique()
+        if x and x.lower() != "nan"
+    )
     estados_detalle = st.multiselect(
         "Estado operativo detallado",
-        sorted(
-            x for x in operativo["PAT_ESTADO_DETALLE"].dropna().unique()
-            if str(x).strip()
-        ),
+        estados_detalle_opciones,
+        key=f"v8_{firma_archivo}_estado_detalle",
     )
 
+    estados_agrupados_opciones = sorted(
+        operativo["PAT_ESTADO_AGRUPADO"]
+        .dropna()
+        .astype(str)
+        .unique()
+    )
     estados_agrupados = st.multiselect(
         "Estado operativo agrupado",
-        sorted(operativo["PAT_ESTADO_AGRUPADO"].dropna().unique()),
+        estados_agrupados_opciones,
+        key=f"v8_{firma_archivo}_estado_agrupado",
     )
 
     centros = []
     if op_centro_col:
+        centros_opciones = sorted(
+            x
+            for x in operativo[op_centro_col]
+            .dropna()
+            .astype(str)
+            .unique()
+            if x and x.lower() != "nan"
+        )
         centros = st.multiselect(
             "Centro / Orden Costo",
-            sorted(
-                x for x in operativo[op_centro_col].dropna().astype(str).unique()
-                if x and x.lower() != "nan"
-            ),
+            centros_opciones,
+            key=f"v8_{firma_archivo}_centros",
         )
 
     vehiculos = []
     if op_vehiculo_col:
+        vehiculos_opciones = sorted(
+            x
+            for x in operativo[op_vehiculo_col]
+            .dropna()
+            .astype(str)
+            .unique()
+            if x and x.lower() != "nan"
+        )
         vehiculos = st.multiselect(
             "Tipo de vehículo",
-            sorted(
-                x for x in operativo[op_vehiculo_col].dropna().astype(str).unique()
-                if x and x.lower() != "nan"
-            ),
+            vehiculos_opciones,
+            key=f"v8_{firma_archivo}_vehiculos",
         )
 
     modalidades = []
     if op_modalidad_col:
+        modalidades_opciones = sorted(
+            x
+            for x in operativo[op_modalidad_col]
+            .dropna()
+            .astype(str)
+            .unique()
+            if x and x.lower() != "nan"
+        )
         modalidades = st.multiselect(
             "Modalidad",
-            sorted(
-                x for x in operativo[op_modalidad_col].dropna().astype(str).unique()
-                if x and x.lower() != "nan"
-            ),
+            modalidades_opciones,
+            key=f"v8_{firma_archivo}_modalidades",
         )
+
+    st.caption(
+        f"Meses DATA: {len(meses_operativos)} · "
+        f"Meses financieros: {len(meses_financieros)}"
+    )
 
 
 operativo_f = operativo[operativo["AÑO_MES"].isin(meses)].copy()
@@ -558,6 +650,19 @@ if modalidades and op_modalidad_col:
     operativo_f = operativo_f[
         operativo_f[op_modalidad_col].astype(str).isin(modalidades)
     ]
+
+if operativo_f.empty:
+    st.error(
+        "Los filtros dejaron el análisis operativo sin registros. "
+        "Pulsa 'Restablecer filtros' en la barra lateral."
+    )
+    st.stop()
+
+if financiero_f.empty:
+    st.warning(
+        "No existen registros financieros para los meses seleccionados. "
+        "El análisis operativo continuará mostrando los datos de DATA."
+    )
 
 
 # ============================================================
@@ -684,6 +789,12 @@ tabs = st.tabs([
 
 with tabs[0]:
     st.subheader("Resumen Ejecutivo RCN")
+
+    st.caption(
+        f"Periodo operativo seleccionado: {', '.join(meses)} · "
+        f"Registros CRUCE_DATA_PAT: {entero(len(operativo_f))} · "
+        f"Registros BASE_MAESTRA_RCN: {entero(len(financiero_f))}"
+    )
 
     st.markdown("### Resumen operativo")
     cols = st.columns(6)
