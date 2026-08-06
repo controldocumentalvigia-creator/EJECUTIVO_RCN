@@ -393,11 +393,11 @@ operativo["PAT_ESTADO_AGRUPADO"] = operativo["ESTADO_OPERATIVO_AGRUPADO"]
 
 op_centro_col = buscar_columna(
     operativo,
-    ["PAT_CENTRO_ORDEN_COSTO", "DATA_CENTRO_ORDEN_COSTO"],
+    ["DATA_CENTRO_ORDEN_COSTO", "PAT_CENTRO_ORDEN_COSTO"],
 )
 op_modalidad_col = buscar_columna(
     operativo,
-    ["PAT_MODALIDAD", "DATA_MODALIDAD"],
+    ["DATA_MODALIDAD", "PAT_MODALIDAD"],
 )
 op_vehiculo_col = buscar_columna(
     operativo,
@@ -405,11 +405,11 @@ op_vehiculo_col = buscar_columna(
 )
 op_origen_col = buscar_columna(
     operativo,
-    ["PAT_ORIGEN", "DATA_ORIGEN"],
+    ["DATA_ORIGEN", "PAT_ORIGEN"],
 )
 op_destino_col = buscar_columna(
     operativo,
-    ["PAT_DESTINO", "DATA_DESTINO"],
+    ["DATA_DESTINO", "PAT_DESTINO"],
 )
 
 
@@ -1222,8 +1222,8 @@ with tabs[6]:
         )
     else:
         st.caption(
-            "Fuente: CRUCE_DATA_PAT. La evolución usa todos los meses disponibles "
-            "en DATA dentro del período seleccionado."
+            f"Fuente: CRUCE_DATA_PAT → {centro_col}. "
+            "La evolución usa todos los meses disponibles en DATA."
         )
 
         # Top 5 calculado sobre todo el período operativo filtrado.
