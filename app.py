@@ -1233,7 +1233,7 @@ with tabs[6]:
             .reset_index(name="TOTAL_SERVICIOS")
             .sort_values("TOTAL_SERVICIOS", ascending=False)
         )
-        top_centros = ranking_centros.head(5)[centro_col].tolist()
+        top_centros = ranking_centros.head(10)[centro_col].tolist()
 
         st.plotly_chart(
             pareto(
