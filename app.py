@@ -1,4 +1,4 @@
-"""RCN Informe Ejecutivo V11.1. Ejecutar: streamlit run app.py"""
+"""RCN Informe Ejecutivo V11.2. Ejecutar: streamlit run app.py"""
 import io, re, unicodedata
 import numpy as np
 import pandas as pd
@@ -233,9 +233,9 @@ def exportar(hojas):
 # INFORME EJECUTIVO V10: lectura flexible, sin bloqueo por versión.
 # ================================================================
 from datetime import datetime
-st.set_page_config(page_title='RCN Informe Ejecutivo V11',page_icon='📊',layout='wide')
+st.set_page_config(page_title='RCN Informe Ejecutivo V11.2',page_icon='📊',layout='wide')
 st.markdown('''<style>.block-container{padding-top:1rem}h1,h2,h3{color:#003B75!important}div[data-testid="stMetric"]{border:1px solid #dce3ef;border-radius:10px;padding:9px}div[data-testid="stDataFrame"]{font-size:12px}</style>''',unsafe_allow_html=True)
-st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V11')
+st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V11.2')
 st.caption('Demanda DATA · Resultado PAT · Ejecución TRAYECTOS · Variaciones · Rentabilidad · Calidad de datos')
 
 def fmt(x):
@@ -369,6 +369,72 @@ def comparativo_barras(d,series,titulo):
     fig.update_layout(barmode='group')
     estilo(fig,titulo,520);ejes_meses(fig,d,'PERIODO')
     return fig
+
+def barras_comparativas_con_variacion(d, series, titulo):
+    """Barras DATA/PAT y variación mensual calculada dentro de cada serie."""
+    if d.empty:return estilo(go.Figure(),titulo)
+    colores=['#003B75','#D43D3D','#008A3D','#F58220']
+    fig=go.Figure()
+    for i,(campo,nombre) in enumerate(series):
+        if campo not in d:continue
+        vals=pd.to_numeric(d[campo],errors='coerce')
+        var=vals.pct_change(fill_method=None)*100
+        texto=[];custom=[]
+        for n,v in zip(vals,var):
+            if pd.isna(n):texto.append('');custom.append('Sin dato PAT');continue
+            cambio='Base' if pd.isna(v) else ('▲ ' if v>0 else '▼ ' if v<0 else '▬ ')+pct_plain(abs(v))
+            texto.append(f'{fmt(n)}<br>{cambio}')
+            custom.append(cambio)
+        fig.add_bar(x=d.PERIODO,y=vals,name=nombre,marker_color=colores[i%len(colores)],
+                    text=texto,textposition='outside',textfont=dict(size=10,color='#172B4D'),
+                    customdata=custom,hovertemplate='%{x}<br>%{fullData.name}: %{y:,.0f}<br>Variación: %{customdata}<extra></extra>',cliponaxis=False)
+    fig.update_layout(barmode='group',uniformtext_minsize=9,uniformtext_mode='hide')
+    estilo(fig,titulo,565);ejes_meses(fig,d,'PERIODO')
+    fig.update_yaxes(rangemode='tozero')
+    return fig
+
+
+def tabla_mensual_completa(d,indice,grupo,valor,meses,top=12):
+    """Malla explícita: cero significa que hay cobertura y no hubo registros."""
+    t=d.groupby([indice,grupo],dropna=False).size().reset_index(name=valor)
+    principales=d[grupo].value_counts().head(top).index.tolist()
+    tabla=t[t[grupo].isin(principales)].pivot(index=grupo,columns=indice,values=valor)
+    tabla=tabla.reindex(index=principales,columns=meses).fillna(0).astype(int)
+    tabla['TOTAL']=tabla.sum(axis=1)
+    return tabla.reset_index()
+
+
+def ranking_vehiculos(d,campo,titulo):
+    if d.empty:return estilo(go.Figure(),titulo),pd.DataFrame()
+    t=d.copy();t['_TIPO']=t[campo].fillna('SIN DATO').astype(str).str.strip().str.upper()
+    t['_TIPO']=t['_TIPO'].replace({'':'SIN DATO','NAN':'SIN DATO'})
+    res=t.groupby('_TIPO').size().reset_index(name='SERVICIOS').sort_values('SERVICIOS',ascending=False)
+    res['PARTICIPACION_%']=res.SERVICIOS/res.SERVICIOS.sum()*100
+    graf=res.head(12).sort_values('SERVICIOS')
+    fig=go.Figure(go.Bar(x=graf.SERVICIOS,y=graf._TIPO,orientation='h',marker_color='#003B75',
+        text=[f'{fmt(n)}  |  {pct_plain(p)}' for n,p in zip(graf.SERVICIOS,graf['PARTICIPACION_%'])],
+        textposition='outside',cliponaxis=False,
+        hovertemplate='%{y}: %{x:,.0f} servicios<extra></extra>'))
+    estilo(fig,titulo,max(410,75+len(graf)*42))
+    fig.update_layout(margin=dict(l=185,r=150,t=80,b=55),showlegend=False)
+    fig.update_xaxes(title='Servicios',rangemode='tozero')
+    fig.update_yaxes(title='',tickfont=dict(size=12,color='#172B4D'))
+    return fig,res
+
+
+def tabla_rutas_iniciales_vs_reales(op,fin):
+    """Comparación descriptiva por par origen/destino, sin afirmar conciliación uno a uno."""
+    inicial=op.copy();ejec=fin.copy()
+    oi=first(inicial,['DATA_ORIGEN']);di=first(inicial,['DATA_DESTINO'])
+    oe=first(ejec,['ORIGEN','ASTRANS_ORIGEN']);de=first(ejec,['DESTINO','ASTRANS_DESTINO'])
+    if not all([oi,di,oe,de]):return pd.DataFrame()
+    for d,o,decol in [(inicial,oi,di),(ejec,oe,de)]:
+        d['_RUTA']=d[o].map(normalizar_lugar)+' → '+d[decol].map(normalizar_lugar)
+    a=inicial.groupby('_RUTA').size().rename('SOLICITADOS_DATA')
+    b=ejec.groupby('_RUTA').size().rename('EJECUTADOS_ASTRANS')
+    res=pd.concat([a,b],axis=1).fillna(0).astype(int).reset_index().rename(columns={'_RUTA':'RUTA'})
+    res['DIFERENCIA']=res.EJECUTADOS_ASTRANS-res.SOLICITADOS_DATA
+    return res.sort_values(['SOLICITADOS_DATA','EJECUTADOS_ASTRANS'],ascending=False)
 
 def first(d,names):
     for name in names:
@@ -544,7 +610,7 @@ if not pat_detalle.empty:
         .rename(columns={pcol:'PERIODO'}))
 else:
     pat_mes=pd.DataFrame(columns=['PERIODO','GESTIONADOS_PAT','CANCELADOS_PAT','TOTAL_PAT','CON_SEV_PAT'])
-comparativo_pat=op_mes[['PERIODO','SOLICITUDES']].merge(pat_mes,on='PERIODO',how='outer').sort_values('PERIODO')
+comparativo_pat=op_mes[['PERIODO','SOLICITUDES','CANCELADAS_DATA']].merge(pat_mes,on='PERIODO',how='outer').sort_values('PERIODO')
 comparativo_pat['TASA_CANCELACION_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.CANCELADOS_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
 comparativo_pat['COBERTURA_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.TOTAL_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
 fin_mes=fin_unico.groupby(pcol,as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum')).rename(columns={pcol:'PERIODO'}).sort_values('PERIODO')
@@ -588,17 +654,25 @@ with tabs[3]:
         st.dataframe(op.groupby('ESTADO_FINAL_SOLICITUD',dropna=False).size().reset_index(name='CANTIDAD'),hide_index=True,use_container_width=True)
 with tabs[4]:
     c1,c2=st.columns(2)
-    with c1:st.plotly_chart(barras(op_mes,'PERIODO','CANCELADAS_DATA','Cancelaciones iniciales y variación',color='#D43D3D'),use_container_width=True)
+    with c1:
+        st.plotly_chart(barras_comparativas_con_variacion(
+            comparativo_pat,[('CANCELADAS_DATA','Cancelaciones iniciales DATA'),('CANCELADOS_PAT','Cancelaciones reales PAT')],
+            'Cancelaciones iniciales vs reales y variación mensual'),use_container_width=True)
     with c2:
         st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%'],'Tasa de cancelación inicial DATA (%)',porcentaje=True),use_container_width=True)
     if not legacy:
         st.plotly_chart(comparativo_barras(op_mes,[('CANCELADAS_DATA','Canceladas inicialmente DATA'),('CANCELADAS_FINALES','Canceladas finales conciliadas')],'Seguimiento de cancelaciones iniciales vs finales'),use_container_width=True)
         st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%','TASA_CANCEL_FINAL_%'],'Evolución de tasas de cancelación (%)',porcentaje=True),use_container_width=True)
         st.plotly_chart(pareto(op[op.ES_CANCELACION_FINAL],'DATA_CENTRO_ORDEN_COSTO','Pareto de cancelaciones finales por centro'),use_container_width=True)
-    st.dataframe(op_mes,hide_index=True,use_container_width=True)
+    tabla_cancel=comparativo_pat[['PERIODO','SOLICITUDES','CANCELADAS_DATA','CANCELADOS_PAT','TASA_CANCELACION_PAT_%']].copy()
+    tabla_cancel['VAR_INICIAL_%']=tabla_cancel.CANCELADAS_DATA.pct_change(fill_method=None)*100
+    tabla_cancel['VAR_REAL_PAT_%']=tabla_cancel.CANCELADOS_PAT.pct_change(fill_method=None)*100
+    tabla_cancel['DIFERENCIA_PAT_MENOS_DATA']=tabla_cancel.CANCELADOS_PAT-tabla_cancel.CANCELADAS_DATA
+    st.caption('PAT sin cobertura se muestra N/D, no como cero. SEV prevalece sobre Cancelado; diferencias no significan necesariamente incumplimientos.')
+    st.dataframe(tabla_cancel.style.format({'TASA_CANCELACION_PAT_%':lambda x:pct_plain(x),'VAR_INICIAL_%':lambda x:pct(x),'VAR_REAL_PAT_%':lambda x:pct(x)},na_rep='N/D'),hide_index=True,use_container_width=True)
 with tabs[5]:
     st.subheader('Solicitudes DATA vs gestionados y cancelados PAT')
-    st.caption('Solicitados: filas originales DATA. Gestionados PAT: órdenes únicas con resultado no cancelado (incluye remesa SEV). Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. Las fuentes tienen coberturas distintas.')
+    st.caption('Solicitados: filas originales DATA. Gestionados PAT: órdenes únicas con resultado no cancelado o pendiente (incluye remesa SEV). Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. Las fuentes tienen coberturas distintas.')
     if pat_mes.empty:
         st.warning('Esta Base Maestra no contiene DETALLE_PAT. Genera la Base Maestra con Data Factory actualizada o carga las tres fuentes originales para ver el resultado PAT.')
     else:
@@ -617,7 +691,21 @@ with tabs[5]:
         st.dataframe(comparativo_pat,hide_index=True,use_container_width=True)
         st.info('Si PAT registra una remesa SEV y también un estado Cancelado, se contabiliza como gestionado y se conserva la alerta para revisión del coordinador. La cobertura PAT comienza en junio para los archivos suministrados.')
 with tabs[6]:
-    st.plotly_chart(linea(op_mes,'PERIODO',['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA'],'Evolución de la producción operativa'),use_container_width=True)
+    st.subheader('Evolución de la producción operativa: cantidades y variaciones')
+    evolucion=op_mes[['PERIODO','SOLICITUDES','GESTIONADAS','CANCELADAS_DATA']].copy()
+    for campo in ['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA']:
+        evolucion['VAR_'+campo+'_%']=evolucion[campo].pct_change(fill_method=None)*100
+    fig_evol=go.Figure()
+    for campo,nombre,color in [('SOLICITUDES','Solicitudes DATA','#5CAEF5'),('GESTIONADAS','Gestión inicial DATA','#003B75'),('CANCELADAS_DATA','Canceladas DATA','#D43D3D')]:
+        var=evolucion['VAR_'+campo+'_%']
+        textos=[f'{fmt(n)}<br>{"Base" if pd.isna(v) else pct(v)}' for n,v in zip(evolucion[campo],var)]
+        fig_evol.add_scatter(x=evolucion.PERIODO,y=evolucion[campo],name=nombre,mode='lines+markers+text',
+            text=textos,textposition='top center',textfont=dict(size=10,color='#172B4D'),
+            line=dict(color=color,width=3),marker=dict(size=9),cliponaxis=False)
+    estilo(fig_evol,'Evolución mensual: cantidad y variación respecto al periodo anterior',600)
+    ejes_meses(fig_evol,evolucion,'PERIODO');fig_evol.update_layout(margin=dict(l=60,r=45,t=80,b=70))
+    st.plotly_chart(fig_evol,use_container_width=True)
+    st.dataframe(evolucion.style.format({c:lambda x:pct(x) for c in evolucion if c.startswith('VAR_')},na_rep='Base'),hide_index=True,use_container_width=True)
     if not legacy:st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS'],'SEV y ejecución conciliada'),use_container_width=True)
     st.plotly_chart(barras(fin_mes,'PERIODO','REMESAS','Remesas ejecutadas y variación'),use_container_width=True)
     st.dataframe(op_mes,hide_index=True,use_container_width=True)
@@ -637,7 +725,11 @@ with tabs[8]:
         evol=malla.merge(evol,on=['MES','DATA_CENTRO_ORDEN_COSTO'],how='left').fillna({'SOLICITUDES':0})
         fig=px.line(evol,x='MES',y='SOLICITUDES',color='DATA_CENTRO_ORDEN_COSTO',markers=True,title='Evolución mensual por centro de costo (top 12)')
         estilo(fig,'Evolución mensual por centro de costo (top 12)',580);ejes_meses(fig,evol,'MES');st.plotly_chart(fig,use_container_width=True)
-    st.dataframe(op.groupby('DATA_CENTRO_ORDEN_COSTO').size().reset_index(name='SOLICITUDES').sort_values('SOLICITUDES',ascending=False).head(30),hide_index=True,use_container_width=True)
+    st.subheader('Tabla de evolución por producción — incluye meses con cero solicitudes')
+    st.caption('0 = ninguna solicitud registrada para esa producción en el mes; no significa necesariamente que se perdió el cliente.')
+    tabla_centros=tabla_mensual_completa(op,'MES','DATA_CENTRO_ORDEN_COSTO','SOLICITUDES',sorted(op.MES.dropna().unique()),top=20)
+    st.dataframe(tabla_centros,hide_index=True,use_container_width=True)
+    st.download_button('📥 Descargar tabla de centros de costo (CSV)',tabla_centros.to_csv(index=False).encode('utf-8-sig'),file_name='RCN_CENTROS_COSTO_MENSUAL.csv',mime='text/csv')
     fcent=fin_unico[fin_unico.FUENTE_CENTRO_COSTO.isin(['DATA','PAT'])]
     if not fcent.empty:
         st.subheader('Financiero por centro conciliado')
@@ -648,8 +740,12 @@ with tabs[9]:
     m=first(fin_unico,['T.NEGOCIO','TRAY. PROP','LINEA NEG'])
     c1,c2=st.columns(2)
     with c1:
-        if v:st.plotly_chart(donut(fin_unico,v,'Tipo de vehículo ejecutado'),use_container_width=True)
-        else:st.plotly_chart(donut(op,'DATA_TIPO_VEHICULO','Tipo de vehículo solicitado'),use_container_width=True)
+        veh_base=fin_unico if v else op
+        veh_campo=v if v else 'DATA_TIPO_VEHICULO'
+        fig_veh,tabla_veh=ranking_vehiculos(veh_base,veh_campo,'Ranking de tipos de vehículo — cantidad y participación')
+        st.plotly_chart(fig_veh,use_container_width=True)
+        st.dataframe(tabla_veh.style.format({'PARTICIPACION_%':lambda x:pct_plain(x)}),hide_index=True,use_container_width=True)
+        st.caption('Ranking horizontal en lugar de dona: los tipos de baja participación siguen siendo legibles.')
     with c2:
         if m:st.plotly_chart(donut(fin_unico,m,'Modalidad / negocio'),use_container_width=True)
         else:st.plotly_chart(donut(op,'DATA_MODALIDAD','Modalidad solicitada'),use_container_width=True)
@@ -661,8 +757,16 @@ with tabs[10]:
     else:st.info('No hay suficientes orígenes y destinos en los registros ejecutados seleccionados.')
     fig2=mapa_calor(op,'DATA_ORIGEN','DATA_DESTINO','Mapa de calor de solicitudes — Origen × Destino')
     if fig2:st.plotly_chart(fig2,use_container_width=True)
-    if origen and destino and not fin_unico.empty:
-        st.dataframe(fin_unico.groupby([origen,destino]).size().reset_index(name='REMESAS').sort_values('REMESAS',ascending=False).head(30),hide_index=True,use_container_width=True)
+    st.subheader('Trayectos iniciales DATA vs trayectos ejecutados ASTRANS')
+    st.caption('DATA refleja solicitudes por origen–destino; ASTRANS refleja remesas ejecutadas. Son unidades de distinta fuente y su diferencia no es una tasa de incumplimiento.')
+    fig_rutas=comparativo_barras(op_mes.merge(fin_mes[['PERIODO','REMESAS']],on='PERIODO',how='left'),
+        [('SOLICITUDES','Trayectos solicitados DATA'),('REMESAS','Trayectos ejecutados ASTRANS')],
+        'Trayectos solicitados vs ejecutados por periodo')
+    st.plotly_chart(fig_rutas,use_container_width=True)
+    tabla_rutas=tabla_rutas_iniciales_vs_reales(op,fin_unico)
+    if not tabla_rutas.empty:
+        st.dataframe(tabla_rutas.head(50),hide_index=True,use_container_width=True)
+    else:st.info('No hay pares origen–destino comparables con los filtros actuales.')
 with tabs[11]:
     st.metric('Casos para coordinador',len(rev))
     if not rev.empty:st.dataframe(rev,use_container_width=True,hide_index=True)
@@ -673,6 +777,8 @@ with tabs[11]:
     if not duplicados.empty:st.dataframe(duplicados,hide_index=True,use_container_width=True)
     st.warning('SEV prevalece sobre Estado Cancelado de PAT. El caso debe corregirse con el coordinador, sin alterar el registro original.')
 with tabs[12]:
-    hojas_export={'RESUMEN_OPERATIVO':op_mes,'RESUMEN_FINANCIERO':fin_mes,'SOLICITUDES_FILTRADAS':op,'TRAYECTOS_FILTRADOS':fin,'REMESAS_UNICAS':fin_unico,'REVISION_COORDINADOR':rev,'REMESAS_DUPLICADAS':duplicados,'SIN_SEV':fin_sin_sev}
+    hojas_export={'RESUMEN_OPERATIVO':op_mes,'RESUMEN_FINANCIERO':fin_mes,
+        'CANCELACIONES_COMPARATIVO':comparativo_pat,'CENTROS_MENSUALES':tabla_mensual_completa(op,'MES','DATA_CENTRO_ORDEN_COSTO','SOLICITUDES',sorted(op.MES.dropna().unique()),top=30),
+        'TRAYECTOS_RUTAS':tabla_rutas_iniciales_vs_reales(op,fin_unico),'SOLICITUDES_FILTRADAS':op,'TRAYECTOS_FILTRADOS':fin,'REMESAS_UNICAS':fin_unico,'REVISION_COORDINADOR':rev,'REMESAS_DUPLICADAS':duplicados,'SIN_SEV':fin_sin_sev}
     st.download_button('📥 Descargar informe ejecutivo Excel',exportar(hojas_export),file_name='RCN_INFORME_EJECUTIVO_V11.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
     st.caption('Las variaciones comparan periodos seleccionados consecutivos. Cuando se filtran meses no contiguos, se comparan únicamente los periodos visibles.')
