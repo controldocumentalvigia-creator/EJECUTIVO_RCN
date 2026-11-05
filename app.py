@@ -1,4 +1,4 @@
-"""RCN Informe Ejecutivo V10. Ejecutar: streamlit run app.py"""
+"""RCN Informe Ejecutivo V11. Ejecutar: streamlit run app.py"""
 import io, re, unicodedata
 import numpy as np
 import pandas as pd
@@ -233,9 +233,9 @@ def exportar(hojas):
 # INFORME EJECUTIVO V10: lectura flexible, sin bloqueo por versión.
 # ================================================================
 from datetime import datetime
-st.set_page_config(page_title='RCN Informe Ejecutivo V10',page_icon='📊',layout='wide')
+st.set_page_config(page_title='RCN Informe Ejecutivo V11',page_icon='📊',layout='wide')
 st.markdown('''<style>.block-container{padding-top:1rem}h1,h2,h3{color:#003B75!important}div[data-testid="stMetric"]{border:1px solid #dce3ef;border-radius:10px;padding:9px}div[data-testid="stDataFrame"]{font-size:12px}</style>''',unsafe_allow_html=True)
-st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V10')
+st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V11')
 st.caption('Demanda DATA · Resultado PAT · Ejecución TRAYECTOS · Variaciones · Rentabilidad · Calidad de datos')
 
 def fmt(x):
@@ -244,7 +244,11 @@ def fmt(x):
 def cop(x):return '$ '+fmt(x)+' COP'
 def pct(x):
     if pd.isna(x):return '—'
-    return f'{x:+.2f}%'.replace('.',',')
+    return f'{float(x):+.2f}%'.replace('.',',')
+
+def pct_plain(x):
+    if pd.isna(x):return '—'
+    return f'{float(x):.2f}%'.replace('.',',')
 def periodo(d,fecha):
     d=d.copy();dt=pd.to_datetime(d[fecha],errors='coerce',dayfirst=True)
     d['MES']=dt.dt.strftime('%Y-%m');d['AÑO']=dt.dt.year
@@ -258,48 +262,112 @@ def variacion(d,col):
     d['VAR_'+col+'_%']=d[col].pct_change(fill_method=None)*100
     return d
 
-def barras(d,x,y,titulo,moneda=False,color='#003B75'):
-    d=d.sort_values(x).copy()
-    v=d[y].pct_change(fill_method=None)*100
-    d['_TEXTO']=[(cop(a) if moneda else fmt(a))+'<br>'+('Base' if pd.isna(b) else ('▲ ' if b>0 else '▼ ' if b<0 else '▬ ')+pct(b)) for a,b in zip(d[y],v)]
-    fig=px.bar(d,x=x,y=y,text='_TEXTO',title=titulo)
-    fig.update_traces(marker_color=color,textposition='outside',textfont_size=10)
-    fig.update_layout(height=470,plot_bgcolor='white',paper_bgcolor='white',font_color='#263238',margin=dict(l=30,r=25,t=60,b=40),xaxis_type='category')
+MESES_ES={1:'Ene',2:'Feb',3:'Mar',4:'Abr',5:'May',6:'Jun',7:'Jul',8:'Ago',9:'Sep',10:'Oct',11:'Nov',12:'Dic'}
+
+def etiqueta_periodo(x):
+    x=str(x)
+    if re.fullmatch(r'\d{4}-\d{2}',x):
+        return MESES_ES.get(int(x[-2:]),x)+' '+x[:4]
+    return x
+
+def estilo(fig, titulo=None, alto=480, porcentaje_eje=False):
+    if titulo:fig.update_layout(title=dict(text=titulo,font=dict(size=19,color='#003B75')))
+    fig.update_layout(height=alto,template='plotly_white',paper_bgcolor='#FFFFFF',plot_bgcolor='#FFFFFF',
+        font=dict(family='Arial, sans-serif',color='#172B4D',size=13),
+        margin=dict(l=55,r=35,t=78,b=90),
+        legend=dict(font=dict(size=12,color='#172B4D'),bgcolor='rgba(255,255,255,.9)'),
+        xaxis=dict(tickfont=dict(size=13,color='#172B4D'),title_font=dict(color='#172B4D'),
+                   showline=True,linecolor='#9BA9BB',type='category'),
+        yaxis=dict(tickfont=dict(size=12,color='#172B4D'),title_font=dict(color='#172B4D'),gridcolor='#E7EDF4'))
+    if porcentaje_eje:fig.update_yaxes(ticksuffix=' %',tickformat='.1f')
     return fig
 
-def linea(d,x,cols,titulo):
-    d=d.sort_values(x)
+def ejes_meses(fig, d, x):
+    if x in d and not d.empty:
+        vals=sorted(d[x].dropna().astype(str).unique())
+        fig.update_xaxes(tickmode='array',tickvals=vals,ticktext=[etiqueta_periodo(v) for v in vals],tickangle=0)
+    return fig
+
+def barras(d,x,y,titulo,moneda=False,color='#003B75'):
+    d=d.sort_values(x).copy()
+    if d.empty:return estilo(go.Figure(),titulo)
+    v=d[y].pct_change(fill_method=None)*100
+    d['_TEXTO']=[(cop(a) if moneda else fmt(a))+'<br>'+('Base' if pd.isna(b) else ('▲ ' if b>0 else '▼ ' if b<0 else '▬ ')+pct_plain(abs(b))) for a,b in zip(d[y],v)]
+    fig=px.bar(d,x=x,y=y,text='_TEXTO',title=titulo)
+    fig.update_traces(marker_color=color,textposition='outside',textfont=dict(size=11,color='#172B4D'),cliponaxis=False)
+    estilo(fig,titulo,510);ejes_meses(fig,d,x)
+    fig.update_yaxes(rangemode='tozero')
+    return fig
+
+def linea(d,x,cols,titulo,porcentaje=False):
+    d=d.sort_values(x).copy()
+    if d.empty:return estilo(go.Figure(),titulo)
     fig=px.line(d,x=x,y=cols,markers=True,title=titulo)
-    fig.update_traces(mode='lines+markers+text',textposition='top center')
-    fig.update_layout(height=450,plot_bgcolor='white',paper_bgcolor='white',font_color='#263238',xaxis_type='category')
+    for trace in fig.data:
+        trace.update(line=dict(width=3),marker=dict(size=8))
+        if porcentaje:
+            trace.update(mode='lines+markers+text',text=[pct_plain(z) if pd.notna(z) else '' for z in trace.y],textposition='top center',textfont=dict(size=11,color='#172B4D'))
+    estilo(fig,titulo,480,porcentaje);ejes_meses(fig,d,x)
     return fig
 
 def donut(d,col,titulo,top=12):
     t=d.groupby(col,dropna=False).size().nlargest(top).reset_index(name='CANTIDAD')
     fig=px.pie(t,names=col,values='CANTIDAD',hole=.45,title=titulo)
     fig.update_traces(textinfo='percent+label')
-    fig.update_layout(height=450,font_color='#263238')
-    return fig
+    return estilo(fig,titulo,470)
 
 def pareto(d,col,titulo,top=20):
     t=d.groupby(col,dropna=False).size().nlargest(top).reset_index(name='CANTIDAD')
-    if t.empty:return go.Figure()
+    if t.empty:return estilo(go.Figure(),titulo)
     t['ACUM_%']=t.CANTIDAD.cumsum()/t.CANTIDAD.sum()*100
     fig=go.Figure()
     fig.add_bar(x=t[col],y=t.CANTIDAD,text=t.CANTIDAD,textposition='outside',name='Cantidad',marker_color='#003B75')
-    fig.add_scatter(x=t[col],y=t['ACUM_%'],yaxis='y2',mode='lines+markers',name='% acumulado',line=dict(color='#F58220',width=3))
-    fig.update_layout(title=titulo,height=510,yaxis2=dict(overlaying='y',side='right',range=[0,110],title='% acumulado'),plot_bgcolor='white',paper_bgcolor='white',font_color='#263238')
+    fig.add_scatter(x=t[col],y=t['ACUM_%'],yaxis='y2',mode='lines+markers',name='% acumulado',line=dict(color='#F58220',width=3),text=[pct_plain(x) for x in t['ACUM_%']])
+    estilo(fig,titulo,530)
+    fig.update_layout(yaxis2=dict(overlaying='y',side='right',range=[0,110],title='% acumulado',ticksuffix=' %',tickfont=dict(color='#172B4D')))
+    fig.update_xaxes(tickangle=-30)
     return fig
+
+def normalizar_lugar(x):
+    z=norm(x)
+    z=re.sub(r'\s+',' ',z).strip(' -.,')
+    return z if z else 'SIN DATO'
 
 def mapa_calor(d,origen,destino,titulo):
     if not origen or not destino or d.empty:return None
-    sub=d[[origen,destino]].fillna('SIN DATO').astype(str)
-    top_o=sub[origen].value_counts().head(12).index;top_d=sub[destino].value_counts().head(12).index
-    sub=sub[sub[origen].isin(top_o)&sub[destino].isin(top_d)]
+    sub=d[[origen,destino]].copy()
+    sub['ORIGEN_N']=sub[origen].map(normalizar_lugar)
+    sub['DESTINO_N']=sub[destino].map(normalizar_lugar)
+    sub=sub[(sub.ORIGEN_N!='SIN DATO')&(sub.DESTINO_N!='SIN DATO')]
     if sub.empty:return None
-    pivot=pd.crosstab(sub[origen],sub[destino])
-    fig=px.imshow(pivot,text_auto=True,aspect='auto',color_continuous_scale='Blues',title=titulo)
-    fig.update_layout(height=570,font_color='#263238',xaxis_tickangle=-35)
+    top_o=sub.ORIGEN_N.value_counts().head(12).index
+    top_d=sub.DESTINO_N.value_counts().head(12).index
+    sub=sub[sub.ORIGEN_N.isin(top_o)&sub.DESTINO_N.isin(top_d)]
+    pivot=pd.crosstab(sub.ORIGEN_N,sub.DESTINO_N)
+    if pivot.empty:return None
+    # Escala logarítmica para que una ruta muy frecuente no oculte el resto.
+    import plotly.graph_objects as go
+    z=np.log1p(pivot.to_numpy(dtype=float))
+    etiquetas=pivot.to_numpy(dtype=int)
+    fig=go.Figure(go.Heatmap(x=pivot.columns.tolist(),y=pivot.index.tolist(),z=z,
+        text=etiquetas,texttemplate='%{text}',textfont=dict(size=11),
+        colorscale='YlOrRd',colorbar=dict(title='Intensidad<br>log(1+n)',tickfont=dict(color='#172B4D')),
+        customdata=etiquetas,hovertemplate='Origen: %{y}<br>Destino: %{x}<br>Servicios: %{customdata:,.0f}<extra></extra>',
+        xgap=2,ygap=2))
+    estilo(fig,titulo,630)
+    fig.update_xaxes(tickangle=-35)
+    fig.update_yaxes(autorange='reversed')
+    return fig
+
+def comparativo_barras(d,series,titulo):
+    if d.empty:return estilo(go.Figure(),titulo)
+    fig=go.Figure()
+    colores=['#003B75','#D43D3D','#008A3D','#F58220']
+    for i,(columna,nombre) in enumerate(series):
+        if columna in d:
+            fig.add_bar(x=d.PERIODO,y=d[columna],name=nombre,marker_color=colores[i%len(colores)],text=d[columna],textposition='outside',cliponaxis=False)
+    fig.update_layout(barmode='group')
+    estilo(fig,titulo,520);ejes_meses(fig,d,'PERIODO')
     return fig
 
 def first(d,names):
@@ -441,7 +509,7 @@ fin_mes['TICKET_PROMEDIO']=np.where(fin_mes.REMESAS.ne(0),fin_mes.FACTURACION/fi
 for m in ['REMESAS','FACTURACION','COSTOS','MARGEN','TICKET_PROMEDIO']:
     fin_mes['VAR_'+m+'_%']=fin_mes[m].pct_change(fill_method=None)*100
 
-names=['🏢 Resumen ejecutivo','📋 DATA estados','🔗 PAT y conciliación','❌ Cancelaciones','📈 Producción y variaciones','💰 Financiero','🎬 Centros de costo','🚙 Vehículo y modalidad','🗺 Mapas de calor','⚠️ Trazabilidad','📥 Exportar']
+names=['🏢 Resumen ejecutivo','📋 DATA estados','📊 Estados detallados','🔗 PAT y conciliación','❌ Cancelaciones','🚦 Realizados vs cancelados','📈 Producción y variaciones','💰 Financiero','🎬 Centros de costo','🚙 Vehículo y modalidad','🗺 Mapas de calor','⚠️ Trazabilidad','📥 Exportar']
 tabs=st.tabs(names)
 with tabs[0]:
     c1,c2=st.columns(2)
@@ -456,6 +524,16 @@ with tabs[1]:
     with c2:st.plotly_chart(barras(op_mes,'PERIODO','GESTIONADAS','Gestión inicial y variación'),use_container_width=True)
     st.dataframe(op.groupby('DATA_ESTADO_SERVICIO',dropna=False).size().reset_index(name='CANTIDAD').sort_values('CANTIDAD',ascending=False),hide_index=True,use_container_width=True)
 with tabs[2]:
+    st.subheader('Evolución mensual del estado operativo detallado — DATA')
+    detalle=op.groupby(['MES','DATA_ESTADO_SERVICIO'],dropna=False).size().reset_index(name='SERVICIOS')
+    if not detalle.empty:
+        fig=px.bar(detalle,x='MES',y='SERVICIOS',color='DATA_ESTADO_SERVICIO',barmode='group',text='SERVICIOS',title='Evolución mensual del estado operativo detallado')
+        fig.update_traces(textposition='outside',textfont=dict(size=10,color='#172B4D'),cliponaxis=False)
+        estilo(fig,'Evolución mensual del estado operativo detallado',620);ejes_meses(fig,detalle,'MES')
+        st.plotly_chart(fig,use_container_width=True)
+        st.dataframe(detalle.pivot_table(index='MES',columns='DATA_ESTADO_SERVICIO',values='SERVICIOS',fill_value=0),use_container_width=True)
+    else:st.info('No hay estados detallados para los filtros seleccionados.')
+with tabs[3]:
     if legacy:st.warning('No se puede certificar el estado PAT final usando únicamente la base antigua. Reconstruye con las tres fuentes.')
     else:
         c1,c2=st.columns(2)
@@ -463,28 +541,36 @@ with tabs[2]:
         with c2:st.plotly_chart(barras(op_mes,'PERIODO','CON_SEV_PAT','Servicios con remesa SEV'),use_container_width=True)
         st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS','CANCELADAS_FINALES'],'Remesa PAT, ejecución conciliada y cancelaciones'),use_container_width=True)
         st.dataframe(op.groupby('ESTADO_FINAL_SOLICITUD',dropna=False).size().reset_index(name='CANTIDAD'),hide_index=True,use_container_width=True)
-with tabs[3]:
+with tabs[4]:
     c1,c2=st.columns(2)
     with c1:st.plotly_chart(barras(op_mes,'PERIODO','CANCELADAS_DATA','Cancelaciones iniciales y variación',color='#D43D3D'),use_container_width=True)
     with c2:
-        st.plotly_chart(px.line(op_mes,x='PERIODO',y='TASA_CANCEL_DATA_%',markers=True,text='TASA_CANCEL_DATA_%',title='Tasa de cancelación DATA (%)'),use_container_width=True)
+        st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%'],'Tasa de cancelación inicial DATA (%)',porcentaje=True),use_container_width=True)
     if not legacy:
-        st.plotly_chart(px.bar(op_mes,x='PERIODO',y=['CANCELADAS_DATA','CANCELADAS_FINALES'],barmode='group',title='Cancelaciones iniciales vs finales PAT'),use_container_width=True)
+        st.plotly_chart(comparativo_barras(op_mes,[('CANCELADAS_DATA','Canceladas inicialmente DATA'),('CANCELADAS_FINALES','Canceladas finales conciliadas')],'Seguimiento de cancelaciones iniciales vs finales'),use_container_width=True)
+        st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%','TASA_CANCEL_FINAL_%'],'Evolución de tasas de cancelación (%)',porcentaje=True),use_container_width=True)
         st.plotly_chart(pareto(op[op.ES_CANCELACION_FINAL],'DATA_CENTRO_ORDEN_COSTO','Pareto de cancelaciones finales por centro'),use_container_width=True)
     st.dataframe(op_mes,hide_index=True,use_container_width=True)
-with tabs[4]:
+with tabs[5]:
+    st.subheader('Servicios realizados frente a cancelaciones')
+    st.caption('Realizados = remesas SEV únicas con estado de ejecución válido en TRAYECTOS; cancelados finales = resultado conciliado por solicitud DATA/PAT. Son unidades diferentes y se identifican por separado.')
+    comp=op_mes[['PERIODO','CANCELADAS_DATA','CANCELADAS_FINALES']].merge(fin_mes[['PERIODO','REMESAS']],on='PERIODO',how='outer').fillna(0).sort_values('PERIODO')
+    st.plotly_chart(comparativo_barras(comp,[('REMESAS','Servicios realizados (remesas)'),('CANCELADAS_FINALES','Cancelados finales')],'Servicios realizados vs cancelados finales'),use_container_width=True)
+    st.plotly_chart(linea(comp,'PERIODO',['REMESAS','CANCELADAS_FINALES'],'Tendencia: realizados vs cancelados'),use_container_width=True)
+    st.dataframe(comp.rename(columns={'REMESAS':'SERVICIOS_REALIZADOS'}),hide_index=True,use_container_width=True)
+with tabs[6]:
     st.plotly_chart(linea(op_mes,'PERIODO',['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA'],'Evolución de la producción operativa'),use_container_width=True)
     if not legacy:st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS'],'SEV y ejecución conciliada'),use_container_width=True)
     st.plotly_chart(barras(fin_mes,'PERIODO','REMESAS','Remesas ejecutadas y variación'),use_container_width=True)
     st.dataframe(op_mes,hide_index=True,use_container_width=True)
-with tabs[5]:
+with tabs[7]:
     c1,c2=st.columns(2)
     with c1:st.plotly_chart(barras(fin_mes,'PERIODO','FACTURACION','Facturación y variación',moneda=True),use_container_width=True)
     with c2:st.plotly_chart(barras(fin_mes,'PERIODO','MARGEN','Margen y variación',moneda=True,color='#008A3D'),use_container_width=True)
     st.plotly_chart(linea(fin_mes,'PERIODO',['FACTURACION','COSTOS','MARGEN'],'Facturación, costos y margen'),use_container_width=True)
-    st.plotly_chart(linea(fin_mes,'PERIODO',['MARGEN_%'],'Rentabilidad mensual (%)'),use_container_width=True)
+    st.plotly_chart(linea(fin_mes,'PERIODO',['MARGEN_%'],'Rentabilidad mensual (%)',porcentaje=True),use_container_width=True)
     st.dataframe(fin_mes,hide_index=True,use_container_width=True)
-with tabs[6]:
+with tabs[8]:
     st.plotly_chart(pareto(op,'DATA_CENTRO_ORDEN_COSTO','Pareto solicitudes por centro'),use_container_width=True)
     top=op.DATA_CENTRO_ORDEN_COSTO.value_counts().head(12).index
     evol=op[op.DATA_CENTRO_ORDEN_COSTO.isin(top)].groupby(['MES','DATA_CENTRO_ORDEN_COSTO']).size().reset_index(name='SOLICITUDES')
@@ -492,14 +578,14 @@ with tabs[6]:
         malla=pd.MultiIndex.from_product([sorted(op.MES.dropna().unique()),list(top)],names=['MES','DATA_CENTRO_ORDEN_COSTO']).to_frame(index=False)
         evol=malla.merge(evol,on=['MES','DATA_CENTRO_ORDEN_COSTO'],how='left').fillna({'SOLICITUDES':0})
         fig=px.line(evol,x='MES',y='SOLICITUDES',color='DATA_CENTRO_ORDEN_COSTO',markers=True,title='Evolución mensual por centro de costo (top 12)')
-        fig.update_layout(height=540,xaxis_type='category');st.plotly_chart(fig,use_container_width=True)
+        estilo(fig,'Evolución mensual por centro de costo (top 12)',580);ejes_meses(fig,evol,'MES');st.plotly_chart(fig,use_container_width=True)
     st.dataframe(op.groupby('DATA_CENTRO_ORDEN_COSTO').size().reset_index(name='SOLICITUDES').sort_values('SOLICITUDES',ascending=False).head(30),hide_index=True,use_container_width=True)
     fcent=fin_unico[fin_unico.FUENTE_CENTRO_COSTO.isin(['DATA','PAT'])]
     if not fcent.empty:
         st.subheader('Financiero por centro conciliado')
         st.dataframe(fcent.groupby('CENTRO_COSTO_CONCILIADO',as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum'),MARGEN=('MARGEN_CALCULADO','sum')).sort_values('FACTURACION',ascending=False),hide_index=True,use_container_width=True)
     st.caption(f'Remesas únicas sin centro de costo conciliado: {len(fin_unico)-len(fcent)}. No se asignan ingresos a producciones por suposición.')
-with tabs[7]:
+with tabs[9]:
     v=first(fin_unico,['T. VEHICULO','T.VEHICULO','T VEHICULO'])
     m=first(fin_unico,['T.NEGOCIO','TRAY. PROP','LINEA NEG'])
     c1,c2=st.columns(2)
@@ -510,7 +596,7 @@ with tabs[7]:
         if m:st.plotly_chart(donut(fin_unico,m,'Modalidad / negocio'),use_container_width=True)
         else:st.plotly_chart(donut(op,'DATA_MODALIDAD','Modalidad solicitada'),use_container_width=True)
     if 'PLACA' in fin_unico:st.dataframe(fin_unico.groupby('PLACA').size().reset_index(name='REMESAS').sort_values('REMESAS',ascending=False).head(20),hide_index=True,use_container_width=True)
-with tabs[8]:
+with tabs[10]:
     origen=first(fin_unico,['ORIGEN','ASTRANS_ORIGEN']);destino=first(fin_unico,['DESTINO','ASTRANS_DESTINO'])
     fig=mapa_calor(fin_unico,origen,destino,'Mapa de calor de rutas ejecutadas — Origen × Destino')
     if fig:st.plotly_chart(fig,use_container_width=True)
@@ -519,7 +605,7 @@ with tabs[8]:
     if fig2:st.plotly_chart(fig2,use_container_width=True)
     if origen and destino and not fin_unico.empty:
         st.dataframe(fin_unico.groupby([origen,destino]).size().reset_index(name='REMESAS').sort_values('REMESAS',ascending=False).head(30),hide_index=True,use_container_width=True)
-with tabs[9]:
+with tabs[11]:
     st.metric('Casos para coordinador',len(rev))
     if not rev.empty:st.dataframe(rev,use_container_width=True,hide_index=True)
     else:st.info('Sin alertas disponibles en el libro seleccionado.')
@@ -528,7 +614,7 @@ with tabs[9]:
     st.metric('Registros ejecutados sin remesa SEV',len(fin_sin_sev))
     if not duplicados.empty:st.dataframe(duplicados,hide_index=True,use_container_width=True)
     st.warning('SEV prevalece sobre Estado Cancelado de PAT. El caso debe corregirse con el coordinador, sin alterar el registro original.')
-with tabs[10]:
+with tabs[12]:
     hojas_export={'RESUMEN_OPERATIVO':op_mes,'RESUMEN_FINANCIERO':fin_mes,'SOLICITUDES_FILTRADAS':op,'TRAYECTOS_FILTRADOS':fin,'REMESAS_UNICAS':fin_unico,'REVISION_COORDINADOR':rev,'REMESAS_DUPLICADAS':duplicados,'SIN_SEV':fin_sin_sev}
-    st.download_button('📥 Descargar informe ejecutivo Excel',exportar(hojas_export),file_name='RCN_INFORME_EJECUTIVO_V10.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
+    st.download_button('📥 Descargar informe ejecutivo Excel',exportar(hojas_export),file_name='RCN_INFORME_EJECUTIVO_V11.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
     st.caption('Las variaciones comparan periodos seleccionados consecutivos. Cuando se filtran meses no contiguos, se comparan únicamente los periodos visibles.')
