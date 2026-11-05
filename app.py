@@ -1,4 +1,4 @@
-"""RCN Informe Ejecutivo V11.4. Ejecutar: streamlit run app.py"""
+"""RCN Informe Ejecutivo V12. Ejecutar: streamlit run app.py"""
 import io, re, unicodedata
 import numpy as np
 import pandas as pd
@@ -139,6 +139,7 @@ def conciliar(data, pat, tray):
     p['RESULTADO_PAT'] = np.select([p.PAT_TIENE_SEV,p.PAT_CANCELADO],['PRESTADO_CON_REMESA','CANCELADO_PAT'],default='PENDIENTE_VALIDACION')
     solicitudes = data.merge(p,on='LLAVE_DATA_PAT',how='left',validate='many_to_one')
     solicitudes['COINCIDE_PAT'] = solicitudes.PAT_REGISTROS.notna()
+    solicitudes['ALERTA_LLAVE_DUPLICADA_DATA'] = solicitudes.duplicated('LLAVE_DATA_PAT', keep=False)
     solicitudes['RESULTADO_PAT'] = solicitudes.RESULTADO_PAT.fillna('SIN_REGISTRO_PAT')
     solicitudes['ESTADO_FINAL_SOLICITUD'] = np.select([
         solicitudes.RESULTADO_PAT.eq('PRESTADO_CON_REMESA'),
@@ -191,6 +192,7 @@ def conciliar(data, pat, tray):
     solicitudes['EJECUCION_CONFIRMADA_ASTRANS'] = solicitudes.LLAVE_DATA_PAT.map(comprobadas).fillna(False).astype(bool)
     solicitudes.loc[solicitudes.EJECUCION_CONFIRMADA_ASTRANS,'ESTADO_FINAL_SOLICITUD'] = 'EJECUTADO_CONCILIADO'
     solicitudes['ALERTA_CONCILIACION'] = solicitudes.PAT_ALERTA.fillna('')
+    solicitudes.loc[solicitudes.ALERTA_LLAVE_DUPLICADA_DATA,'ALERTA_CONCILIACION'] += ' | LLAVE DATA DUPLICADA: VALIDAR UNIDAD DE SOLICITUD'
     solicitudes.loc[solicitudes.DATA_CANCELADO & solicitudes.EJECUCION_CONFIRMADA_ASTRANS,'ALERTA_CONCILIACION'] += ' | CANCELADO EN DATA PERO EJECUTADO'
     solicitudes.loc[solicitudes.RESULTADO_PAT.eq('PRESTADO_CON_REMESA') & ~solicitudes.EJECUCION_CONFIRMADA_ASTRANS,'ALERTA_CONCILIACION'] += ' | SEV SIN EJECUCION CONFIRMADA EN ASTRANS'
     revision = pd.concat([
@@ -229,13 +231,9 @@ def exportar(hojas):
                     ws.write(0,j,c,fmt);ws.set_column(j,j,min(38,max(15,len(c)+2)))
     return bio.getvalue()
 
-# ================================================================
-# INFORME EJECUTIVO V10: lectura flexible, sin bloqueo por versión.
-# ================================================================
-from datetime import datetime
-st.set_page_config(page_title='RCN Informe Ejecutivo V11.4',page_icon='📊',layout='wide')
+_config(page_title='RCN Informe Ejecutivo V12',page_icon='📊',layout='wide')
 st.markdown('''<style>.block-container{padding-top:1rem}h1,h2,h3{color:#003B75!important}div[data-testid="stMetric"]{border:1px solid #dce3ef;border-radius:10px;padding:9px}div[data-testid="stDataFrame"]{font-size:12px}</style>''',unsafe_allow_html=True)
-st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V11.4')
+st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V12')
 st.caption('Demanda DATA · Resultado PAT · Ejecución TRAYECTOS · Variaciones · Rentabilidad · Calidad de datos')
 
 def fmt(x):
@@ -565,7 +563,8 @@ if sel_centro and not pat_detalle.empty:
 if sel_veh or sel_modal:
     # PAT no tiene la misma granularidad de vehículo/modalidad; restringir a órdenes DATA filtradas.
     pat_detalle=pat_detalle[pat_detalle.LLAVE_DATA_PAT.isin(set(op.LLAVE_DATA_PAT))].copy()
-pat_detalle=pat_detalle[pat_detalle.MES.isin(sel_mes)].copy()
+# PAT se filtra por llaves DATA seleccionadas, NO por mes PAT: una reprogramación puede cambiar la fecha.
+pat_detalle=pat_detalle[pat_detalle.LLAVE_DATA_PAT.isin(set(op.LLAVE_DATA_PAT))].copy()
 if solo_conciliado:fin=fin[fin.FUENTE_CENTRO_COSTO.astype(str).isin(['DATA','PAT'])].copy()
 if fecha_fin=='Fecha de carga':fin=periodo(fin,'ASTRANS_FECHA_CARGA')
 
@@ -574,20 +573,20 @@ valid=fin[fin.ES_EJECUCION_VALIDA & ~fin.ES_ANULADO].copy()
 valid['ASTRANS_REMESA_NORM']=valid.ASTRANS_REMESA_NORM.fillna('').astype(str)
 con_remesa=valid[valid.ASTRANS_REMESA_NORM.str.startswith('SEV')].copy()
 duplicados=con_remesa[con_remesa.duplicated('ASTRANS_REMESA_NORM',keep=False)].copy()
-fin_unico=con_remesa.drop_duplicates('ASTRANS_REMESA_NORM').copy()
+fin_unico=con_remesa.copy()  # Filas financieras válidas: no eliminar trayectos distintos que comparten SEV
 # Registros sin remesa se muestran en control, no se mezclan en el monto verificado.
 fin_sin_sev=valid[~valid.ASTRANS_REMESA_NORM.str.startswith('SEV')].copy()
 importe=fin_unico.V_CLIENTE_NUM.sum();costo=fin_unico.V_CONDUCT_NUM.sum();margen=importe-costo
 sol=len(op);inic_cancel=int(op.DATA_CANCELADO.sum());inic_gest=sol-inic_cancel
-fin_cancel=int(op.ESTADO_FINAL_SOLICITUD.isin(['CANCELADO_CONFIRMADO_PAT','CANCELADO_DATA_SIN_PAT']).sum()) if not legacy else None
+fin_cancel=int(op.ESTADO_FINAL_SOLICITUD.eq('CANCELADO_CONFIRMADO_PAT').sum()) if not legacy else None
 confirm=int(op.EJECUCION_CONFIRMADA_ASTRANS.sum()) if not legacy else None
 sev_pat=int(op.PAT_TIENE_SEV.sum()) if not legacy else None
 st.subheader('Indicadores gerenciales')
-for cols,items in [(st.columns(6),[('Solicitudes DATA',fmt(sol)),('Gestionadas iniciales',fmt(inic_gest)),('Canceladas DATA',fmt(inic_cancel)),('Canceladas finales',fmt(fin_cancel) if fin_cancel is not None else 'N/D'),('Con SEV en PAT',fmt(sev_pat) if sev_pat is not None else 'N/D'),('Ejecutadas conciliadas',fmt(confirm) if confirm is not None else 'N/D')]),(st.columns(6),[('Remesas únicas ASTRANS',fmt(len(fin_unico))),('Facturación',cop(importe)),('Costos',cop(costo)),('Margen',cop(margen)),('Rentabilidad',pct(margen/importe*100 if importe else 0)),('Ticket promedio',cop(importe/len(fin_unico) if len(fin_unico) else 0))])]:
+for cols,items in [(st.columns(6),[('Solicitudes DATA',fmt(sol)),('Gestionadas iniciales',fmt(inic_gest)),('Canceladas DATA',fmt(inic_cancel)),('Canceladas finales',fmt(fin_cancel) if fin_cancel is not None else 'N/D'),('Con SEV en PAT',fmt(sev_pat) if sev_pat is not None else 'N/D'),('Ejecutadas conciliadas',fmt(confirm) if confirm is not None else 'N/D')]),(st.columns(6),[('Remesas únicas ASTRANS',fmt(fin_unico.ASTRANS_REMESA_NORM.nunique())),('Facturación',cop(importe)),('Costos',cop(costo)),('Margen',cop(margen)),('Rentabilidad',pct(margen/importe*100 if importe else 0)),('Ticket promedio',cop(importe/fin_unico.ASTRANS_REMESA_NORM.nunique() if fin_unico.ASTRANS_REMESA_NORM.nunique() else 0))])]:
     for c,(k,v) in zip(cols,items):c.metric(k,v)
-st.caption('El volumen DATA representa solicitudes; PAT registra resultado; TRAYECTOS aporta remesas y valores. Las cifras financieras mostradas excluyen anulados y duplicados de remesa, sujetos a revisión.')
+st.caption('El volumen DATA representa solicitudes; PAT registra resultado; TRAYECTOS aporta remesas y valores. Las cifras financieras excluyen anulados; conservan los registros válidos de una misma remesa sin sumar importes a través de cruces PAT.')
 
-op['ES_CANCELACION_FINAL']=op.ESTADO_FINAL_SOLICITUD.isin(['CANCELADO_CONFIRMADO_PAT','CANCELADO_DATA_SIN_PAT'])
+op['ES_CANCELACION_FINAL']=op.ESTADO_FINAL_SOLICITUD.eq('CANCELADO_CONFIRMADO_PAT')
 op['CON_SEV_PAT']=op.PAT_TIENE_SEV
 op_mes=op.groupby(pcol,as_index=False).agg(SOLICITUDES=('DATA_CANCELADO','size'),GESTIONADAS=('DATA_CANCELADO',lambda s:(~s).sum()),CANCELADAS_DATA=('DATA_CANCELADO','sum'),CANCELADAS_FINALES=('ES_CANCELACION_FINAL','sum'),CON_SEV_PAT=('CON_SEV_PAT','sum'),EJECUTADAS_CONCILIADAS=('EJECUCION_CONFIRMADA_ASTRANS','sum')).rename(columns={pcol:'PERIODO'}).sort_values('PERIODO')
 for m in ['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA','CANCELADAS_FINALES','CON_SEV_PAT','EJECUTADAS_CONCILIADAS']:
@@ -601,9 +600,16 @@ if not pat_detalle.empty:
              PAT_TIENE_SEV=('PAT_TIENE_SEV','max'),
              PAT_CANCELADO=('PAT_CANCELADO','max'),
              PAT_FILAS=('LLAVE_DATA_PAT','size')))
-    pat_solicitudes=periodo(pat_solicitudes,'PAT_FECHA_SERVICIO')
+    # Para la evolución de solicitudes, el resultado PAT se ancla al mes de DATA.
+    # PAT sin orden DATA no se atribuye artificialmente a una solicitud inicial.
+    data_llaves=op[['LLAVE_DATA_PAT','DATA_FECHA_SERVICIO']].drop_duplicates('LLAVE_DATA_PAT')
+    pat_solicitudes=pat_solicitudes.merge(data_llaves,on='LLAVE_DATA_PAT',how='left',validate='one_to_one')
+    pat_solicitudes['COINCIDE_DATA']=pat_solicitudes.DATA_FECHA_SERVICIO.notna()
+    pat_solicitudes=periodo(pat_solicitudes,'DATA_FECHA_SERVICIO')
+    pat_huerfanos=pat_solicitudes[~pat_solicitudes.COINCIDE_DATA].copy()
+    pat_solicitudes=pat_solicitudes[pat_solicitudes.COINCIDE_DATA].copy()
     pat_solicitudes['PAT_CANCELADO_FINAL']=pat_solicitudes.PAT_CANCELADO & ~pat_solicitudes.PAT_TIENE_SEV
-    pat_solicitudes['PAT_GESTIONADO']=~pat_solicitudes.PAT_CANCELADO_FINAL
+    pat_solicitudes['PAT_GESTIONADO']=pat_solicitudes.PAT_TIENE_SEV
     pat_mes=(pat_solicitudes.groupby(pcol,as_index=False)
         .agg(GESTIONADOS_PAT=('PAT_GESTIONADO','sum'),CANCELADOS_PAT=('PAT_CANCELADO_FINAL','sum'),
              TOTAL_PAT=('LLAVE_DATA_PAT','size'),CON_SEV_PAT=('PAT_TIENE_SEV','sum'))
@@ -672,8 +678,8 @@ with tabs[4]:
             st.plotly_chart(linea(vista_pat,'PERIODO',['CANCELADAS_DATA','CANCELADOS_PAT'],
                 'Tendencia: cancelaciones DATA vs PAT'),use_container_width=True)
     if not pat_detalle.empty:
-        pat_periodos=pat_mes['PERIODO'].dropna().astype(str).tolist()
-        st.info('PAT disponible en los periodos: '+', '.join(pat_periodos)+'. En los demás periodos la serie PAT es N/D, no cero.')
+        pat_periodos=pat_detalle['MES'].dropna().astype(str).unique().tolist()
+        st.info('PAT vinculado a solicitudes DATA de los periodos seleccionados: '+', '.join(sorted(pat_periodos))+'. Los periodos sin correspondencia se muestran N/D, no cero.')
 
     if not legacy:
         st.plotly_chart(comparativo_barras(op_mes,[('CANCELADAS_DATA','Canceladas inicialmente DATA'),('CANCELADAS_FINALES','Canceladas finales conciliadas')],'DATA inicial vs resultado conciliado (incluye DATA sin PAT: no equivale a cancelaciones reales PAT)'),use_container_width=True)
@@ -687,7 +693,7 @@ with tabs[4]:
     st.dataframe(tabla_cancel.style.format({'TASA_CANCELACION_PAT_%':lambda x:pct_plain(x),'VAR_INICIAL_%':lambda x:pct(x),'VAR_REAL_PAT_%':lambda x:pct(x)},na_rep='N/D'),hide_index=True,use_container_width=True)
 with tabs[5]:
     st.subheader('Solicitudes DATA vs gestionados y cancelados PAT')
-    st.caption('Solicitados: filas originales DATA. Gestionados PAT: órdenes únicas con resultado no cancelado o pendiente (incluye remesa SEV). Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. Las fuentes tienen coberturas distintas.')
+    st.caption('Solicitados: filas originales DATA. Gestionados PAT: solicitudes únicas con remesa SEV. Los pendientes se reportan aparte. Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. Las fuentes tienen coberturas distintas.')
     if pat_mes.empty:
         st.warning('Esta Base Maestra no contiene DETALLE_PAT. Genera la Base Maestra con Data Factory actualizada o carga las tres fuentes originales para ver el resultado PAT.')
     else:
@@ -707,20 +713,22 @@ with tabs[5]:
         st.info('Si PAT registra una remesa SEV y también un estado Cancelado, se contabiliza como gestionado y se conserva la alerta para revisión del coordinador. La cobertura PAT comienza en junio para los archivos suministrados.')
 with tabs[6]:
     st.subheader('Evolución de la producción operativa: cantidades y variaciones')
-    evolucion=op_mes[['PERIODO','SOLICITUDES','GESTIONADAS','CANCELADAS_DATA']].copy()
-    for campo in ['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA']:
+    evolucion=comparativo_pat[['PERIODO','SOLICITUDES','GESTIONADOS_PAT','CANCELADAS_DATA','CANCELADOS_PAT']].sort_values('PERIODO').copy()
+    for campo in ['SOLICITUDES','GESTIONADOS_PAT','CANCELADAS_DATA','CANCELADOS_PAT']:
         evolucion['VAR_'+campo+'_%']=evolucion[campo].pct_change(fill_method=None)*100
     fig_evol=go.Figure()
-    for campo,nombre,color in [('SOLICITUDES','Solicitudes DATA','#5CAEF5'),('GESTIONADAS','Gestión inicial DATA','#003B75'),('CANCELADAS_DATA','Canceladas DATA','#D43D3D')]:
-        var=evolucion['VAR_'+campo+'_%']
-        textos=[f'{fmt(n)}<br>{"Base" if pd.isna(v) else pct(v)}' for n,v in zip(evolucion[campo],var)]
+    for campo,nombre,color in [('SOLICITUDES','Solicitudes DATA','#5CAEF5'),('GESTIONADOS_PAT','Gestionados PAT (SEV)','#008A3D'),('CANCELADAS_DATA','Cancelaciones iniciales DATA','#003B75'),('CANCELADOS_PAT','Cancelaciones finales PAT','#D43D3D')]:
+        textos=[f'{fmt(n)}<br>{"Base" if pd.isna(v) else pct(v)}' if pd.notna(n) else '' for n,v in zip(evolucion[campo],evolucion['VAR_'+campo+'_%'])]
         fig_evol.add_scatter(x=evolucion.PERIODO,y=evolucion[campo],name=nombre,mode='lines+markers+text',
             text=textos,textposition='top center',textfont=dict(size=10,color='#172B4D'),
-            line=dict(color=color,width=3),marker=dict(size=9),cliponaxis=False)
-    estilo(fig_evol,'Evolución mensual: cantidad y variación respecto al periodo anterior',600)
+            line=dict(color=color,width=3),marker=dict(size=8),cliponaxis=False)
+    estilo(fig_evol,'Evolución: DATA inicial → resultado PAT (cantidades y variaciones)',620)
     ejes_meses(fig_evol,evolucion,'PERIODO');fig_evol.update_layout(margin=dict(l=60,r=45,t=80,b=70))
     st.plotly_chart(fig_evol,use_container_width=True)
+    st.caption('Resultado PAT atribuido al mes de la solicitud original DATA. Meses sin correspondencia PAT: N/D. TRAYECTOS se analiza por separado.')
     st.dataframe(evolucion.style.format({c:lambda x:pct(x) for c in evolucion if c.startswith('VAR_')},na_rep='Base'),hide_index=True,use_container_width=True)
+    if not pat_detalle.empty:
+        st.caption(f'PAT sin correspondencia DATA en el filtro: {len(pat_huerfanos)} solicitudes únicas. No se asignan a una producción o mes DATA sin evidencia.')
     if not legacy:st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS'],'SEV y ejecución conciliada'),use_container_width=True)
     st.plotly_chart(barras(fin_mes,'PERIODO','REMESAS','Remesas ejecutadas y variación'),use_container_width=True)
     st.dataframe(op_mes,hide_index=True,use_container_width=True)
