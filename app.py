@@ -1,4 +1,4 @@
-"""RCN Informe Ejecutivo V11. Ejecutar: streamlit run app.py"""
+"""RCN Informe Ejecutivo V11.1. Ejecutar: streamlit run app.py"""
 import io, re, unicodedata
 import numpy as np
 import pandas as pd
@@ -397,7 +397,7 @@ try:
         _,rp=leer_excel(fp.getvalue(),['ACTUALIZADO','BASE'],[('Fecha Servicio',),('REMESAS',),('Estado',),('No. Orden Servicio','SERVICIO')])
         _,rt=leer_excel(ft.getvalue(),['ORDPLA_L01 (75)','Sheet1'],[('TRAYECTO','REMESA'),('ESTADO OPER','ESTADO OP'),('V.CLIENTE',)])
         hojas=conciliar(preparar_data(rd),preparar_pat(rp,'ACTUALIZADO'),preparar_tray(rt))
-        op=hojas['BASE_SOLICITUDES'].copy();fin=hojas['BASE_MAESTRA_RCN'].copy();rev=hojas['REVISION_COORDINADOR'].copy()
+        op=hojas['BASE_SOLICITUDES'].copy();fin=hojas['BASE_MAESTRA_RCN'].copy();rev=hojas['REVISION_COORDINADOR'].copy();pat_detalle=hojas['DETALLE_PAT'].copy()
         st.success('Se reconstruyó la Base Maestra directamente desde las tres fuentes.')
         st.download_button('📥 Descargar Base Maestra reconstruida',exportar(hojas),file_name='BASE_MAESTRA_RCN_ACTUALIZADA.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         legacy=False
@@ -406,7 +406,7 @@ try:
         if not legacy:
             op=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_SOLICITUDES')
             fin=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_MAESTRA_RCN')
-            rev=pd.read_excel(io.BytesIO(raw),sheet_name='REVISION_COORDINADOR') if 'REVISION_COORDINADOR' in book.sheet_names else pd.DataFrame()
+            rev=pd.read_excel(io.BytesIO(raw),sheet_name='REVISION_COORDINADOR') if 'REVISION_COORDINADOR' in book.sheet_names else pd.DataFrame();pat_detalle=pd.read_excel(io.BytesIO(raw),sheet_name='DETALLE_PAT') if 'DETALLE_PAT' in book.sheet_names else pd.DataFrame()
         else:
             if not {'CRUCE_DATA_PAT','BASE_MAESTRA_RCN'}.issubset(book.sheet_names):
                 st.error('El libro no contiene CRUCE_DATA_PAT y BASE_MAESTRA_RCN. Carga los tres originales para reconstruirlo.')
@@ -440,6 +440,7 @@ if legacy:
     fin['FUENTE_CENTRO_COSTO']='NO_CONCILIADO_HISTORICO'
     fin['RESULTADO_SERVICIO']='HISTORICO_SIN_VALIDAR'
     fin['ESTADO_TRAZABILIDAD']='NO_VALIDADO'
+if legacy:pat_detalle=pd.DataFrame()
 for c in ['DATA_CANCELADO','EJECUCION_CONFIRMADA_ASTRANS','PAT_TIENE_SEV']:
     op[c]=boolean(op[c]) if c in op else False
 for c in ['ES_ANULADO','ES_EJECUCION_VALIDA','ES_CIERRE_PENDIENTE']:
@@ -453,6 +454,25 @@ for c in ['CENTRO_COSTO_CONCILIADO','FUENTE_CENTRO_COSTO','RESULTADO_SERVICIO','
 
 op=periodo(op,'DATA_FECHA_SERVICIO');fin=periodo(fin,'ASTRANS_FECHA_SERVICIO')
 fin['MES_CARGA']=pd.to_datetime(fin.ASTRANS_FECHA_CARGA,errors='coerce',dayfirst=True).dt.strftime('%Y-%m')
+# PAT se mide con sus registros originales, NO con el estado inicial de DATA.
+# Una solicitud con varias filas PAT cuenta una sola vez por fecha + orden.
+# La remesa SEV prevalece ante un estado cancelado contradictorio.
+if not pat_detalle.empty:
+    pat_detalle['PAT_FECHA_SERVICIO']=pd.to_datetime(pat_detalle['PAT_FECHA_SERVICIO'],errors='coerce',dayfirst=True)
+    if 'LLAVE_DATA_PAT' not in pat_detalle:
+        pat_detalle['LLAVE_DATA_PAT']=key(pat_detalle['PAT_FECHA_SERVICIO'],pat_detalle['PAT_ORDEN_SERVICIO'])
+    if 'PAT_TIENE_SEV' not in pat_detalle:
+        pat_detalle['PAT_TIENE_SEV']=pat_detalle['PAT_REMESAS_ORIGINAL'].fillna('').map(lambda x:bool(remesas(x)))
+    else:pat_detalle['PAT_TIENE_SEV']=boolean(pat_detalle['PAT_TIENE_SEV'])
+    if 'PAT_CANCELADO' not in pat_detalle:
+        pat_detalle['PAT_CANCELADO']=pat_detalle['PAT_ESTADO'].fillna('').map(lambda x:'CANCEL' in norm(x)) | pat_detalle['PAT_REMESAS_ORIGINAL'].fillna('').map(lambda x:'CANCEL' in norm(x))
+    else:pat_detalle['PAT_CANCELADO']=boolean(pat_detalle['PAT_CANCELADO'])
+    pat_detalle['PAT_CENTRO_ORDEN_COSTO']=pat_detalle.get('PAT_CENTRO_ORDEN_COSTO',pd.Series('',index=pat_detalle.index)).fillna('').astype(str)
+    pat_detalle=pat_detalle[pat_detalle.PAT_FECHA_SERVICIO.notna()].copy()
+    pat_detalle=periodo(pat_detalle,'PAT_FECHA_SERVICIO')
+else:
+    pat_detalle=pd.DataFrame(columns=['MES','LLAVE_DATA_PAT','PAT_TIENE_SEV','PAT_CANCELADO','PAT_CENTRO_ORDEN_COSTO'])
+
 with st.sidebar:
     st.header('🔎 Filtros del informe')
     meses=sorted(set(op.MES.dropna().astype(str))|set(fin.MES.dropna().astype(str)))
@@ -474,6 +494,12 @@ if sel_centro:
     fin=fin[fin.CENTRO_COSTO_CONCILIADO.astype(str).isin(sel_centro)].copy()
 if sel_veh:op=op[op.DATA_TIPO_VEHICULO.astype(str).isin(sel_veh)].copy()
 if sel_modal:op=op[op.DATA_MODALIDAD.astype(str).isin(sel_modal)].copy()
+if sel_centro and not pat_detalle.empty:
+    pat_detalle=pat_detalle[pat_detalle.PAT_CENTRO_ORDEN_COSTO.astype(str).isin(sel_centro)].copy()
+if sel_veh or sel_modal:
+    # PAT no tiene la misma granularidad de vehículo/modalidad; restringir a órdenes DATA filtradas.
+    pat_detalle=pat_detalle[pat_detalle.LLAVE_DATA_PAT.isin(set(op.LLAVE_DATA_PAT))].copy()
+pat_detalle=pat_detalle[pat_detalle.MES.isin(sel_mes)].copy()
 if solo_conciliado:fin=fin[fin.FUENTE_CENTRO_COSTO.astype(str).isin(['DATA','PAT'])].copy()
 if fecha_fin=='Fecha de carga':fin=periodo(fin,'ASTRANS_FECHA_CARGA')
 
@@ -502,6 +528,25 @@ for m in ['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA','CANCELADAS_FINALES','CO
     op_mes['VAR_'+m+'_%']=op_mes[m].pct_change(fill_method=None)*100
 op_mes['TASA_CANCEL_DATA_%']=np.where(op_mes.SOLICITUDES>0,op_mes.CANCELADAS_DATA/op_mes.SOLICITUDES*100,0)
 op_mes['TASA_CANCEL_FINAL_%']=np.where(op_mes.SOLICITUDES>0,op_mes.CANCELADAS_FINALES/op_mes.SOLICITUDES*100,0)
+# Resumen PAT con deduplicación por solicitud. Estados contradictorios: gana SEV.
+if not pat_detalle.empty:
+    pat_solicitudes=(pat_detalle.groupby('LLAVE_DATA_PAT',as_index=False)
+        .agg(PAT_FECHA_SERVICIO=('PAT_FECHA_SERVICIO','min'),
+             PAT_TIENE_SEV=('PAT_TIENE_SEV','max'),
+             PAT_CANCELADO=('PAT_CANCELADO','max'),
+             PAT_FILAS=('LLAVE_DATA_PAT','size')))
+    pat_solicitudes=periodo(pat_solicitudes,'PAT_FECHA_SERVICIO')
+    pat_solicitudes['PAT_CANCELADO_FINAL']=pat_solicitudes.PAT_CANCELADO & ~pat_solicitudes.PAT_TIENE_SEV
+    pat_solicitudes['PAT_GESTIONADO']=~pat_solicitudes.PAT_CANCELADO_FINAL
+    pat_mes=(pat_solicitudes.groupby(pcol,as_index=False)
+        .agg(GESTIONADOS_PAT=('PAT_GESTIONADO','sum'),CANCELADOS_PAT=('PAT_CANCELADO_FINAL','sum'),
+             TOTAL_PAT=('LLAVE_DATA_PAT','size'),CON_SEV_PAT=('PAT_TIENE_SEV','sum'))
+        .rename(columns={pcol:'PERIODO'}))
+else:
+    pat_mes=pd.DataFrame(columns=['PERIODO','GESTIONADOS_PAT','CANCELADOS_PAT','TOTAL_PAT','CON_SEV_PAT'])
+comparativo_pat=op_mes[['PERIODO','SOLICITUDES']].merge(pat_mes,on='PERIODO',how='outer').sort_values('PERIODO')
+comparativo_pat['TASA_CANCELACION_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.CANCELADOS_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
+comparativo_pat['COBERTURA_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.TOTAL_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
 fin_mes=fin_unico.groupby(pcol,as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum')).rename(columns={pcol:'PERIODO'}).sort_values('PERIODO')
 fin_mes['MARGEN']=fin_mes.FACTURACION-fin_mes.COSTOS
 fin_mes['MARGEN_%']=np.where(fin_mes.FACTURACION.ne(0),fin_mes.MARGEN/fin_mes.FACTURACION*100,0)
@@ -552,12 +597,25 @@ with tabs[4]:
         st.plotly_chart(pareto(op[op.ES_CANCELACION_FINAL],'DATA_CENTRO_ORDEN_COSTO','Pareto de cancelaciones finales por centro'),use_container_width=True)
     st.dataframe(op_mes,hide_index=True,use_container_width=True)
 with tabs[5]:
-    st.subheader('Servicios realizados frente a cancelaciones')
-    st.caption('Realizados = remesas SEV únicas con estado de ejecución válido en TRAYECTOS; cancelados finales = resultado conciliado por solicitud DATA/PAT. Son unidades diferentes y se identifican por separado.')
-    comp=op_mes[['PERIODO','CANCELADAS_DATA','CANCELADAS_FINALES']].merge(fin_mes[['PERIODO','REMESAS']],on='PERIODO',how='outer').fillna(0).sort_values('PERIODO')
-    st.plotly_chart(comparativo_barras(comp,[('REMESAS','Servicios realizados (remesas)'),('CANCELADAS_FINALES','Cancelados finales')],'Servicios realizados vs cancelados finales'),use_container_width=True)
-    st.plotly_chart(linea(comp,'PERIODO',['REMESAS','CANCELADAS_FINALES'],'Tendencia: realizados vs cancelados'),use_container_width=True)
-    st.dataframe(comp.rename(columns={'REMESAS':'SERVICIOS_REALIZADOS'}),hide_index=True,use_container_width=True)
+    st.subheader('Solicitudes DATA vs gestionados y cancelados PAT')
+    st.caption('Solicitados: filas originales DATA. Gestionados PAT: órdenes únicas con resultado no cancelado (incluye remesa SEV). Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. Las fuentes tienen coberturas distintas.')
+    if pat_mes.empty:
+        st.warning('Esta Base Maestra no contiene DETALLE_PAT. Genera la Base Maestra con Data Factory actualizada o carga las tres fuentes originales para ver el resultado PAT.')
+    else:
+        fig=go.Figure()
+        for campo,nombre,color in [('SOLICITUDES','Solicitudes iniciales DATA','#003B75'),('GESTIONADOS_PAT','Gestionados PAT','#008A3D'),('CANCELADOS_PAT','Cancelados PAT','#D43D3D')]:
+            fig.add_bar(x=comparativo_pat.PERIODO,y=comparativo_pat[campo],name=nombre,marker_color=color,
+                        text=[fmt(v) if pd.notna(v) else '' for v in comparativo_pat[campo]],textposition='outside',cliponaxis=False)
+        fig.update_layout(barmode='group')
+        estilo(fig,'Solicitudes iniciales vs gestión y cancelaciones PAT',540)
+        ejes_meses(fig,comparativo_pat,'PERIODO')
+        st.plotly_chart(fig,use_container_width=True)
+        st.plotly_chart(linea(comparativo_pat,'PERIODO',['SOLICITUDES','GESTIONADOS_PAT','CANCELADOS_PAT'],
+                             'Tendencia mensual de solicitudes y resultado PAT'),use_container_width=True)
+        st.plotly_chart(linea(comparativo_pat,'PERIODO',['TASA_CANCELACION_PAT_%'],
+                             'Cancelaciones finales PAT / solicitudes DATA (%)',porcentaje=True),use_container_width=True)
+        st.dataframe(comparativo_pat,hide_index=True,use_container_width=True)
+        st.info('Si PAT registra una remesa SEV y también un estado Cancelado, se contabiliza como gestionado y se conserva la alerta para revisión del coordinador. La cobertura PAT comienza en junio para los archivos suministrados.')
 with tabs[6]:
     st.plotly_chart(linea(op_mes,'PERIODO',['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA'],'Evolución de la producción operativa'),use_container_width=True)
     if not legacy:st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS'],'SEV y ejecución conciliada'),use_container_width=True)
