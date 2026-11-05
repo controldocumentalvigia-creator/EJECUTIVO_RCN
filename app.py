@@ -1,246 +1,534 @@
-"""RCN Informe Ejecutivo V9 — consume BASE_MAESTRA_RCN_ACTUALIZADA.xlsx.
-Ejecutar: streamlit run app.py
-"""
-import io
-import re
-import unicodedata
+"""RCN Informe Ejecutivo V10. Ejecutar: streamlit run app.py"""
+import io, re, unicodedata
 import numpy as np
 import pandas as pd
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
-
-st.set_page_config(page_title='RCN Informe Ejecutivo V9',page_icon='📊',layout='wide')
-st.markdown('''<style>.block-container{padding-top:1rem}h1,h2,h3{color:#003B75!important}div[data-testid="stMetric"]{border:1px solid #dbe4ef;border-radius:10px;padding:12px}div[data-testid="stDataFrame"]{font-size:12px}</style>''',unsafe_allow_html=True)
-st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V9')
-st.caption('Solicitudes DATA · Resultado PAT · Ejecución y finanzas TRAYECTOS · Trazabilidad de remesas SEV')
-
 
 def norm(x):
-    if pd.isna(x):return ''
-    return ''.join(c for c in unicodedata.normalize('NFKD',str(x).upper().strip()) if not unicodedata.combining(c))
+    if pd.isna(x): return ''
+    return ''.join(c for c in unicodedata.normalize('NFKD', str(x).upper().strip()) if not unicodedata.combining(c))
 
 
-def periodos(d,fecha):
-    d=d.copy();dt=pd.to_datetime(d[fecha],errors='coerce')
-    d['MES']=dt.dt.strftime('%Y-%m');d['ANO']=dt.dt.year
+def col(df, *names):
+    lookup = {re.sub('[^A-Z0-9]', '', norm(c)): c for c in df.columns}
+    for n in names:
+        k = re.sub('[^A-Z0-9]', '', norm(n))
+        if k in lookup: return lookup[k]
+    return None
+
+
+def values(df, *names):
+    c = col(df, *names)
+    return df[c] if c is not None else pd.Series([''] * len(df), index=df.index)
+
+
+def dates(s): return pd.to_datetime(s, errors='coerce', dayfirst=True)
+
+
+def money(s):
+    if pd.api.types.is_numeric_dtype(s): return pd.to_numeric(s, errors='coerce').fillna(0)
+    v = s.fillna('').astype(str).str.replace(r'[^0-9,.-]', '', regex=True)
+    comma = v.str.contains(',', regex=False)
+    v.loc[comma] = v.loc[comma].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+    return pd.to_numeric(v, errors='coerce').fillna(0)
+
+
+def order(s):
+    # Mantener sufijo -000: distintas subórdenes NO deben fusionarse.
+    return s.map(lambda x: re.sub(r'\.0$', '', re.sub(r'\s+', '', norm(x))) if pd.notna(x) else '')
+
+
+def remesas(x):
+    # Acepta SEV006... y múltiples remesas en una misma celda.
+    return list(dict.fromkeys(re.findall(r'SEV\s*[-_]?\s*\d+', norm(x).replace(' ', ''))))
+
+
+def key(fecha, orden):
+    return fecha.dt.strftime('%Y-%m-%d').fillna('') + '|' + order(orden)
+
+
+def estado_data(x):
+    t = norm(x)
+    if 'CANCEL' in t: return 'CANCELADO_INICIAL'
+    if 'RE' in t and 'PROGRAM' in t: return 'REPROGRAMADO_INICIAL'
+    if 'PROGRAM' in t or t in ('LIQUIDADO', 'PRELIQUIDADO', 'CONCILIADO'): return 'GESTIONADO_INICIAL'
+    return 'OTRO_ESTADO_DATA'
+
+
+def leer_excel(archivo, preferred, must):
+    book = pd.ExcelFile(io.BytesIO(archivo))
+    best = None
+    for sh in preferred:
+        if sh not in book.sheet_names: continue
+        d = pd.read_excel(book, sheet_name=sh)
+        if all(col(d, *variants) is not None for variants in must): return sh, d
+    for sh in book.sheet_names:
+        d = pd.read_excel(book, sheet_name=sh)
+        if all(col(d, *variants) is not None for variants in must): return sh, d
+    raise ValueError('No se encontró hoja con las columnas requeridas: ' + str(must))
+
+
+def preparar_data(raw):
+    d = pd.DataFrame(index=raw.index)
+    d['DATA_FECHA_SERVICIO'] = dates(values(raw, 'Fecha Servicio'))
+    d['DATA_ORDEN_SERVICIO'] = values(raw, 'No.OrdenServicio', 'No. Orden Servicio').astype(str).str.strip()
+    d['DATA_ESTADO_SERVICIO'] = values(raw, 'Estado Servicio').astype(str).str.strip()
+    for new, names in {'CENTRO_ORDEN_COSTO':['Centro / Orden Costo'], 'MODALIDAD':['Modalidad'], 'TIPO_VEHICULO':['Tipo de vehículo'], 'ORIGEN':['Origen'], 'DESTINO':['Destino'], 'SOLICITANTE':['Usuario Solicitante'], 'PROVEEDOR':['Proveedor']}.items():
+        d['DATA_'+new] = values(raw, *names).fillna('').astype(str).str.strip()
+    d = d[d.DATA_FECHA_SERVICIO.notna()].copy()
+    d['DATA_ID'] = np.arange(1, len(d)+1)
+    d['LLAVE_DATA_PAT'] = key(d.DATA_FECHA_SERVICIO, d.DATA_ORDEN_SERVICIO)
+    d['CLASE_INICIAL'] = d.DATA_ESTADO_SERVICIO.map(estado_data)
+    d['DATA_CANCELADO'] = d.CLASE_INICIAL.eq('CANCELADO_INICIAL')
+    d['ANO_MES'] = d.DATA_FECHA_SERVICIO.dt.strftime('%Y-%m')
+    return d
+
+
+def preparar_pat(raw, hoja):
+    p = pd.DataFrame(index=raw.index)
+    p['PAT_FECHA_SERVICIO'] = dates(values(raw, 'Fecha Servicio'))
+    p['PAT_ORDEN_SERVICIO'] = values(raw, 'No. Orden Servicio', 'SERVICIO', 'No.OrdenServicio').astype(str).str.strip()
+    p['PAT_REMESAS_ORIGINAL'] = values(raw, 'REMESAS', 'REMESA').fillna('').astype(str).str.strip()
+    p['PAT_ESTADO'] = values(raw, 'Estado').fillna('').astype(str).str.strip()
+    p['PAT_CENTRO_ORDEN_COSTO'] = values(raw, 'Centro / Orden Costo').fillna('').astype(str).str.strip()
+    p['PAT_ORIGEN'] = values(raw, 'ORIGEN').fillna('').astype(str).str.strip()
+    p['PAT_DESTINO'] = values(raw, 'DESTINO').fillna('').astype(str).str.strip()
+    p['PAT_HOJA_ORIGEN'] = hoja
+    p = p[p.PAT_FECHA_SERVICIO.notna()].copy()
+    p['PAT_ID'] = np.arange(1, len(p)+1)
+    p['LLAVE_DATA_PAT'] = key(p.PAT_FECHA_SERVICIO, p.PAT_ORDEN_SERVICIO)
+    p['LISTA_SEV'] = p.PAT_REMESAS_ORIGINAL.map(remesas)
+    p['PAT_TIENE_SEV'] = p.LISTA_SEV.map(bool)
+    p['PAT_CANCELADO'] = p.PAT_ESTADO.map(lambda x:'CANCEL' in norm(x)) | p.PAT_REMESAS_ORIGINAL.map(lambda x:'CANCEL' in norm(x))
+    p['ALERTA_PAT'] = np.where(p.PAT_TIENE_SEV & p.PAT_CANCELADO, 'SEV CON ESTADO CANCELADO - REVISAR COORDINADOR', '')
+    p['RESULTADO_PAT'] = np.select([p.PAT_TIENE_SEV, p.PAT_CANCELADO], ['PRESTADO_CON_REMESA', 'CANCELADO_PAT'], default='PENDIENTE_VALIDACION')
+    return p
+
+
+def preparar_tray(raw):
+    t = raw.copy()
+    t['ASTRANS_TRAYECTO'] = values(t, 'TRAYECTO', 'REMESA').fillna('').astype(str).str.strip()
+    t['ASTRANS_REMESA_NORM'] = t.ASTRANS_TRAYECTO.map(lambda x: remesas(x)[0] if remesas(x) else '')
+    t['ASTRANS_FECHA_SERVICIO'] = dates(values(t, 'FECHA R', 'FECHA SERVICIO'))
+    t['ASTRANS_FECHA_CARGA'] = dates(values(t, 'CARGA'))
+    t['ASTRANS_ESTADO_OPER'] = values(t, 'ESTADO OPER', 'ESTADO OP').fillna('').astype(str).str.strip()
+    t['V_CLIENTE_NUM'] = money(values(t, 'V.CLIENTE', 'V CLIENTE'))
+    t['V_CONDUCT_NUM'] = money(values(t, 'V.CONDUCTOR', 'V.CONDUCT', 'V CONDUCTOR'))
+    t['MARGEN_CALCULADO'] = t.V_CLIENTE_NUM - t.V_CONDUCT_NUM
+    t['ASTRANS_ID'] = np.arange(1, len(t)+1)
+    t['ANO_MES_SERVICIO'] = t.ASTRANS_FECHA_SERVICIO.dt.strftime('%Y-%m')
+    t['ANO_MES_CARGA'] = t.ASTRANS_FECHA_CARGA.dt.strftime('%Y-%m')
+    estado = t.ASTRANS_ESTADO_OPER.map(norm)
+    t['ES_EJECUCION_VALIDA'] = estado.isin(['CUMPLIDO', 'CUMPLIDO OPERATIVO'])
+    t['ES_ANULADO'] = estado.eq('ANULADO')
+    t['ES_CIERRE_PENDIENTE'] = estado.isin(['EN PROGRAMACION','EN TRANSITO','CUMPLIDO OPERATIVO'])
+    return t
+
+
+def conciliar(data, pat, tray):
+    # Resumen PAT por solicitud, preservando detalle en otra hoja.
+    p = pat.groupby('LLAVE_DATA_PAT', as_index=False).agg(
+        PAT_REGISTROS=('PAT_ID','size'), PAT_ESTADOS=('PAT_ESTADO',lambda x:' | '.join(dict.fromkeys(map(str,x)))),
+        PAT_REMESAS=('PAT_REMESAS_ORIGINAL',lambda x:' | '.join(dict.fromkeys(map(str,x)))),
+        PAT_TIENE_SEV=('PAT_TIENE_SEV','max'), PAT_CANCELADO=('PAT_CANCELADO','max'),
+        PAT_ALERTA=('ALERTA_PAT',lambda x:' | '.join(v for v in x if v)),
+        PAT_CENTRO_ORDEN_COSTO=('PAT_CENTRO_ORDEN_COSTO','first'))
+    # La remesa prevalece si un mismo servicio tiene simultáneamente estados contradictorios.
+    p['RESULTADO_PAT'] = np.select([p.PAT_TIENE_SEV,p.PAT_CANCELADO],['PRESTADO_CON_REMESA','CANCELADO_PAT'],default='PENDIENTE_VALIDACION')
+    solicitudes = data.merge(p,on='LLAVE_DATA_PAT',how='left',validate='many_to_one')
+    solicitudes['COINCIDE_PAT'] = solicitudes.PAT_REGISTROS.notna()
+    solicitudes['RESULTADO_PAT'] = solicitudes.RESULTADO_PAT.fillna('SIN_REGISTRO_PAT')
+    solicitudes['ESTADO_FINAL_SOLICITUD'] = np.select([
+        solicitudes.RESULTADO_PAT.eq('PRESTADO_CON_REMESA'),
+        solicitudes.RESULTADO_PAT.eq('CANCELADO_PAT'),
+        solicitudes.RESULTADO_PAT.eq('SIN_REGISTRO_PAT') & solicitudes.DATA_CANCELADO,
+    ], ['PRESTADO_CON_REMESA','CANCELADO_CONFIRMADO_PAT','CANCELADO_DATA_SIN_PAT'], default='PENDIENTE_CONCILIACION')
+    # Tabla puente por remesa individual; no sumar importes a partir de esta tabla.
+    puente = pat.explode('LISTA_SEV').rename(columns={'LISTA_SEV':'REMESA_NORM'})
+    puente = puente[puente.REMESA_NORM.notna() & puente.REMESA_NORM.ne('')].copy()
+    puente['COINCIDE_DATA'] = puente.LLAVE_DATA_PAT.isin(set(data.LLAVE_DATA_PAT))
+    puente['ALERTA_MULTIPLE_PAT'] = puente.duplicated('REMESA_NORM',keep=False)
+    # Cada remesa puede tener más de una fila PAT; no duplicar TRAYECTOS.
+    bridge = puente.groupby('REMESA_NORM',as_index=False).agg(
+        PAT_FILAS_REMESA=('PAT_ID','size'), PAT_ORDEN_SERVICIO=('PAT_ORDEN_SERVICIO',lambda x:' | '.join(dict.fromkeys(map(str,x)))),
+        PAT_ESTADO=('PAT_ESTADO',lambda x:' | '.join(dict.fromkeys(map(str,x)))),
+        PAT_CENTRO_ORDEN_COSTO=('PAT_CENTRO_ORDEN_COSTO',lambda x:next((v for v in x if v),'')),
+        DATA_COINCIDE=('COINCIDE_DATA','max'),
+        PAT_ALERTA=('ALERTA_PAT',lambda x:' | '.join(v for v in x if v)),
+        LLAVE_DATA_PAT=('LLAVE_DATA_PAT',lambda x:' | '.join(dict.fromkeys(map(str,x)))))
+    # Enriquecer remesa con DATA solo cuando existe una única llave DATA por remesa.
+    data_c = data.groupby('LLAVE_DATA_PAT',as_index=False).agg(
+        DATA_CENTRO_ORDEN_COSTO=('DATA_CENTRO_ORDEN_COSTO',lambda x:next((v for v in x if v),'')),
+        DATA_ESTADO_SERVICIO=('DATA_ESTADO_SERVICIO',lambda x:' | '.join(dict.fromkeys(map(str,x)))),
+        DATA_ORDEN_SERVICIO=('DATA_ORDEN_SERVICIO','first'),
+        DATA_FECHA_SERVICIO=('DATA_FECHA_SERVICIO','min'),
+        DATA_CANCELADO=('DATA_CANCELADO','max'))
+    bridge['LLAVE_UNICA'] = bridge.LLAVE_DATA_PAT.map(lambda x: x if ' | ' not in x else '')
+    bridge = bridge.merge(data_c,left_on='LLAVE_UNICA',right_on='LLAVE_DATA_PAT',how='left',suffixes=('','_DATA'))
+    base = tray.merge(bridge,left_on='ASTRANS_REMESA_NORM',right_on='REMESA_NORM',how='left',validate='many_to_one')
+    base['COINCIDE_PAT'] = base.REMESA_NORM.notna()
+    base['COINCIDE_DATA'] = base.DATA_ORDEN_SERVICIO.notna()
+    base['ESTADO_TRAZABILIDAD'] = np.select([
+        base.COINCIDE_DATA,base.COINCIDE_PAT],
+        ['CONCILIADO DATA + PAT + ASTRANS','CONCILIADO PAT + ASTRANS / SIN DATA'],
+        default='ASTRANS SIN PAT')
+    base['ALERTA_CONCILIACION'] = base.PAT_ALERTA.fillna('')
+    base.loc[base.ASTRANS_REMESA_NORM.eq(''),'ALERTA_CONCILIACION'] = 'TRAYECTO SIN REMESA SEV'
+    base.loc[base.ASTRANS_REMESA_NORM.duplicated(keep=False) & base.ASTRANS_REMESA_NORM.ne(''),'ALERTA_CONCILIACION'] += ' | REMESA DUPLICADA ASTRANS'
+    base['RESULTADO_SERVICIO'] = np.select([
+        base.ES_ANULADO, base.ES_EJECUCION_VALIDA,
+        base.ES_CIERRE_PENDIENTE],['ANULADO','EJECUTADO_REGISTRADO','PENDIENTE_CIERRE'],default='REVISAR_ESTADO_ASTRANS')
+    base['CENTRO_COSTO_CONCILIADO'] = base.DATA_CENTRO_ORDEN_COSTO.fillna('')
+    mask = base.CENTRO_COSTO_CONCILIADO.eq('')
+    base.loc[mask,'CENTRO_COSTO_CONCILIADO'] = base.loc[mask,'PAT_CENTRO_ORDEN_COSTO'].fillna('')
+    base['FUENTE_CENTRO_COSTO'] = np.select([base.DATA_CENTRO_ORDEN_COSTO.fillna('').ne(''),base.PAT_CENTRO_ORDEN_COSTO.fillna('').ne('')],['DATA','PAT'],default='SIN_CONCILIAR')
+    # Actualizar solicitudes con existencia en ASTRANS, incluso cuando DATA inicial fue cancelada.
+    remesas_validas = set(base.loc[base.ES_EJECUCION_VALIDA,'ASTRANS_REMESA_NORM']) - {''}
+    puente['EXISTE_ASTRANS_EJECUTADO'] = puente.REMESA_NORM.isin(remesas_validas)
+    comprobadas = puente.groupby('LLAVE_DATA_PAT')['EXISTE_ASTRANS_EJECUTADO'].max()
+    solicitudes['EJECUCION_CONFIRMADA_ASTRANS'] = solicitudes.LLAVE_DATA_PAT.map(comprobadas).fillna(False).astype(bool)
+    solicitudes.loc[solicitudes.EJECUCION_CONFIRMADA_ASTRANS,'ESTADO_FINAL_SOLICITUD'] = 'EJECUTADO_CONCILIADO'
+    solicitudes['ALERTA_CONCILIACION'] = solicitudes.PAT_ALERTA.fillna('')
+    solicitudes.loc[solicitudes.DATA_CANCELADO & solicitudes.EJECUCION_CONFIRMADA_ASTRANS,'ALERTA_CONCILIACION'] += ' | CANCELADO EN DATA PERO EJECUTADO'
+    solicitudes.loc[solicitudes.RESULTADO_PAT.eq('PRESTADO_CON_REMESA') & ~solicitudes.EJECUCION_CONFIRMADA_ASTRANS,'ALERTA_CONCILIACION'] += ' | SEV SIN EJECUCION CONFIRMADA EN ASTRANS'
+    revision = pd.concat([
+        solicitudes.loc[solicitudes.ALERTA_CONCILIACION.str.strip(' |').ne(''),['DATA_FECHA_SERVICIO','DATA_ORDEN_SERVICIO','DATA_CENTRO_ORDEN_COSTO','DATA_ESTADO_SERVICIO','PAT_REMESAS','PAT_ESTADOS','ESTADO_FINAL_SOLICITUD','ALERTA_CONCILIACION']].rename(columns={'DATA_FECHA_SERVICIO':'FECHA','DATA_ORDEN_SERVICIO':'ORDEN','DATA_CENTRO_ORDEN_COSTO':'CENTRO','DATA_ESTADO_SERVICIO':'ESTADO_DATA','PAT_REMESAS':'REMESAS','PAT_ESTADOS':'ESTADO_PAT','ESTADO_FINAL_SOLICITUD':'RESULTADO'}),
+    ],ignore_index=True)
+    revision['ESTADO_GESTION'] = 'PENDIENTE COORDINADOR'
+    revision['OBSERVACIONES_COORDINADOR'] = ''
+    sin_pat = solicitudes[~solicitudes.COINCIDE_PAT].copy()
+    pat_sin_data = pat[~pat.LLAVE_DATA_PAT.isin(set(data.LLAVE_DATA_PAT))].copy()
+    pat_sin_astrans = puente[~puente.REMESA_NORM.isin(set(tray.ASTRANS_REMESA_NORM))].copy()
+    dup_data = data[data.duplicated('LLAVE_DATA_PAT',keep=False)].copy()
+    dup_pat = pat[pat.duplicated('LLAVE_DATA_PAT',keep=False)].copy()
+    dup_tray = tray[tray.ASTRANS_REMESA_NORM.ne('') & tray.duplicated('ASTRANS_REMESA_NORM',keep=False)].copy()
+    return {'BASE_SOLICITUDES':solicitudes,'CRUCE_DATA_PAT':solicitudes,'BASE_MAESTRA_RCN':base,
+        'DETALLE_PAT':pat.drop(columns=['LISTA_SEV']), 'PUENTE_REMESAS':puente.drop(columns=['LISTA_SEV'],errors='ignore'),
+        'REVISION_COORDINADOR':revision,'DATA_SIN_PAT':sin_pat,'PAT_SIN_DATA':pat_sin_data.drop(columns=['LISTA_SEV']),
+        'PAT_SIN_ASTRANS':pat_sin_astrans.drop(columns=['LISTA_SEV'],errors='ignore'),
+        'DUPLICADOS_DATA':dup_data,'DUPLICADOS_PAT':dup_pat.drop(columns=['LISTA_SEV']),
+        'DUPLICADOS_ASTRANS':dup_tray}
+
+
+def exportar(hojas):
+    bio=io.BytesIO()
+    with pd.ExcelWriter(bio,engine='xlsxwriter',datetime_format='dd/mm/yyyy') as writer:
+        for name,df in hojas.items():
+            d=df.copy()
+            for c in d.columns:
+                if d[c].map(lambda x:isinstance(x,list)).any(): d[c]=d[c].map(str)
+            d.to_excel(writer,sheet_name=name[:31],index=False)
+            ws=writer.sheets[name[:31]]
+            ws.freeze_panes(1,0)
+            if len(d.columns):
+                ws.autofilter(0,0,len(d),len(d.columns)-1)
+                fmt=writer.book.add_format({'bold':True,'font_color':'white','bg_color':'#003B75','align':'center'})
+                for j,c in enumerate(d.columns):
+                    ws.write(0,j,c,fmt);ws.set_column(j,j,min(38,max(15,len(c)+2)))
+    return bio.getvalue()
+
+# ================================================================
+# INFORME EJECUTIVO V10: lectura flexible, sin bloqueo por versión.
+# ================================================================
+from datetime import datetime
+st.set_page_config(page_title='RCN Informe Ejecutivo V10',page_icon='📊',layout='wide')
+st.markdown('''<style>.block-container{padding-top:1rem}h1,h2,h3{color:#003B75!important}div[data-testid="stMetric"]{border:1px solid #dce3ef;border-radius:10px;padding:9px}div[data-testid="stDataFrame"]{font-size:12px}</style>''',unsafe_allow_html=True)
+st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V10')
+st.caption('Demanda DATA · Resultado PAT · Ejecución TRAYECTOS · Variaciones · Rentabilidad · Calidad de datos')
+
+def fmt(x):
+    try:return f'{float(x):,.0f}'.replace(',','.')
+    except:return '0'
+def cop(x):return '$ '+fmt(x)+' COP'
+def pct(x):
+    if pd.isna(x):return '—'
+    return f'{x:+.2f}%'.replace('.',',')
+def periodo(d,fecha):
+    d=d.copy();dt=pd.to_datetime(d[fecha],errors='coerce',dayfirst=True)
+    d['MES']=dt.dt.strftime('%Y-%m');d['AÑO']=dt.dt.year
     d['BIMESTRE']=dt.dt.year.astype('Int64').astype(str)+'-B'+(((dt.dt.month-1)//2)+1).astype('Int64').astype(str)
     d['TRIMESTRE']=dt.dt.year.astype('Int64').astype(str)+'-T'+(((dt.dt.month-1)//3)+1).astype('Int64').astype(str)
     d['SEMESTRE']=dt.dt.year.astype('Int64').astype(str)+'-S'+(((dt.dt.month-1)//6)+1).astype('Int64').astype(str)
     return d
 
+def variacion(d,col):
+    d=d.sort_values('PERIODO').copy()
+    d['VAR_'+col+'_%']=d[col].pct_change(fill_method=None)*100
+    return d
 
-def fmt(n):return f'{n:,.0f}'.replace(',','.')
-
-def cop(n):return '$ '+fmt(n)+' COP'
-
-def pct(n):return f'{n:.2f}%'.replace('.',',')
-
-def bar(d,x,y,title,color='#003B75'):
-    fig=px.bar(d,x=x,y=y,text=y,title=title)
-    fig.update_traces(marker_color=color,textposition='outside')
-    fig.update_layout(height=430,plot_bgcolor='white',paper_bgcolor='white',font_color='#253047',margin=dict(l=20,r=20,t=55,b=40))
+def barras(d,x,y,titulo,moneda=False,color='#003B75'):
+    d=d.sort_values(x).copy()
+    v=d[y].pct_change(fill_method=None)*100
+    d['_TEXTO']=[(cop(a) if moneda else fmt(a))+'<br>'+('Base' if pd.isna(b) else ('▲ ' if b>0 else '▼ ' if b<0 else '▬ ')+pct(b)) for a,b in zip(d[y],v)]
+    fig=px.bar(d,x=x,y=y,text='_TEXTO',title=titulo)
+    fig.update_traces(marker_color=color,textposition='outside',textfont_size=10)
+    fig.update_layout(height=470,plot_bgcolor='white',paper_bgcolor='white',font_color='#263238',margin=dict(l=30,r=25,t=60,b=40),xaxis_type='category')
     return fig
 
+def linea(d,x,cols,titulo):
+    d=d.sort_values(x)
+    fig=px.line(d,x=x,y=cols,markers=True,title=titulo)
+    fig.update_traces(mode='lines+markers+text',textposition='top center')
+    fig.update_layout(height=450,plot_bgcolor='white',paper_bgcolor='white',font_color='#263238',xaxis_type='category')
+    return fig
 
-def table_agg(d,group,metric):
-    if d.empty:return pd.DataFrame(columns=[group,metric])
-    return d.groupby(group,dropna=False).size().reset_index(name=metric).sort_values(group)
+def donut(d,col,titulo,top=12):
+    t=d.groupby(col,dropna=False).size().nlargest(top).reset_index(name='CANTIDAD')
+    fig=px.pie(t,names=col,values='CANTIDAD',hole=.45,title=titulo)
+    fig.update_traces(textinfo='percent+label')
+    fig.update_layout(height=450,font_color='#263238')
+    return fig
 
+def pareto(d,col,titulo,top=20):
+    t=d.groupby(col,dropna=False).size().nlargest(top).reset_index(name='CANTIDAD')
+    if t.empty:return go.Figure()
+    t['ACUM_%']=t.CANTIDAD.cumsum()/t.CANTIDAD.sum()*100
+    fig=go.Figure()
+    fig.add_bar(x=t[col],y=t.CANTIDAD,text=t.CANTIDAD,textposition='outside',name='Cantidad',marker_color='#003B75')
+    fig.add_scatter(x=t[col],y=t['ACUM_%'],yaxis='y2',mode='lines+markers',name='% acumulado',line=dict(color='#F58220',width=3))
+    fig.update_layout(title=titulo,height=510,yaxis2=dict(overlaying='y',side='right',range=[0,110],title='% acumulado'),plot_bgcolor='white',paper_bgcolor='white',font_color='#263238')
+    return fig
 
-def exportar(hojas):
-    buf=io.BytesIO()
-    with pd.ExcelWriter(buf,engine='xlsxwriter',datetime_format='dd/mm/yyyy') as w:
-        for name,d in hojas.items():
-            d.to_excel(w,sheet_name=name[:31],index=False)
-            ws=w.sheets[name[:31]];ws.freeze_panes(1,0)
-            if len(d.columns):
-                ws.autofilter(0,0,len(d),len(d.columns)-1)
-                fmt_head=w.book.add_format({'bold':True,'font_color':'white','bg_color':'#003B75'})
-                for i,c in enumerate(d.columns):ws.write(0,i,c,fmt_head);ws.set_column(i,i,min(36,max(15,len(c)+2)))
-    return buf.getvalue()
+def mapa_calor(d,origen,destino,titulo):
+    if not origen or not destino or d.empty:return None
+    sub=d[[origen,destino]].fillna('SIN DATO').astype(str)
+    top_o=sub[origen].value_counts().head(12).index;top_d=sub[destino].value_counts().head(12).index
+    sub=sub[sub[origen].isin(top_o)&sub[destino].isin(top_d)]
+    if sub.empty:return None
+    pivot=pd.crosstab(sub[origen],sub[destino])
+    fig=px.imshow(pivot,text_auto=True,aspect='auto',color_continuous_scale='Blues',title=titulo)
+    fig.update_layout(height=570,font_color='#263238',xaxis_tickangle=-35)
+    return fig
 
-st.info('📌 Esta aplicación requiere la Base Maestra **V9** generada con la aplicación **Data Factory V9**. Una Base Maestra V8 o anterior no contiene todas las hojas necesarias para la conciliación.')
-f=st.file_uploader('Cargar BASE_MAESTRA_RCN_ACTUALIZADA.xlsx (generada por Data Factory V9)',type=['xlsx'])
-if not f:
-    st.info('Primero ejecuta **app (1).py**, carga DATA RCN, SERVICIO PAT y TRAYECTOS TODOS, y descarga la nueva Base Maestra. Luego cárgala aquí.')
+def first(d,names):
+    for name in names:
+        if name in d.columns:return name
+    return None
+
+def boolean(s):
+    if pd.api.types.is_bool_dtype(s):return s.fillna(False)
+    return s.fillna('').astype(str).str.upper().isin(['TRUE','VERDADERO','1','SI'])
+
+st.info('Compatible con Base Maestra V9/V10. Si cargas una base antigua, puedes reconstruirla aquí mismo desde las tres fuentes originales; no se bloqueará la aplicación.')
+f=st.file_uploader('Cargar BASE_MAESTRA_RCN_ACTUALIZADA.xlsx o BASE_MAESTRA_RCN.xlsx',type='xlsx',key='maestra')
+with st.expander('🔧 Reconstruir la Base Maestra directamente con DATA + PAT + TRAYECTOS (sin usar Data Factory)',expanded=False):
+    c1,c2,c3=st.columns(3)
+    with c1: fd=st.file_uploader('DATA RCN original',type='xlsx',key='origen_data')
+    with c2: fp=st.file_uploader('SERVICIO PAT original',type='xlsx',key='origen_pat')
+    with c3: ft=st.file_uploader('TRAYECTOS TODOS original',type='xlsx',key='origen_tray')
+    st.caption('Si cargas los tres originales, se recalculan las 12 hojas y prevalece esta conciliación sobre cualquier Base Maestra antigua.')
+
+if not f and not all([fd,fp,ft]):
+    st.info('Carga una Base Maestra o los tres archivos originales para comenzar.')
     st.stop()
 try:
-    raw=f.getvalue()
-    book=pd.ExcelFile(io.BytesIO(raw))
-except Exception as e:
-    st.error('No se pudo abrir el archivo Excel. Verifica que sea un libro .xlsx válido y que no esté dañado.')
-    st.caption(f'Detalle técnico: {e}')
-    st.stop()
-required=['BASE_SOLICITUDES','BASE_MAESTRA_RCN','REVISION_COORDINADOR']
-missing=[name for name in required if name not in book.sheet_names]
-if missing:
-    st.error('**Archivo incompatible: la Base Maestra cargada no corresponde al formato V9.**')
-    st.write('**Hojas encontradas:** '+', '.join(f'`{name}`' for name in book.sheet_names))
-    st.write('**Hojas faltantes:** '+', '.join(f'`{name}`' for name in missing))
-    st.warning('No es posible calcular de forma confiable los resultados finales de PAT, la prioridad de las remesas SEV y las alertas de revisión del coordinador a partir de esta base antigua.')
-    st.markdown('''**Cómo solucionarlo:**
-    1. Abre la aplicación **RCN Data Factory V9** (`app (1).py`).
-    2. Carga los archivos originales **DATA RCN**, **SERVICIO PAT** y **TRAYECTOS TODOS**.
-    3. Descarga el Excel **BASE_MAESTRA_RCN_ACTUALIZADA.xlsx**.
-    4. Regresa aquí y reemplaza el archivo cargado por el Excel recién generado.
+    if all([fd,fp,ft]):
+        _,rd=leer_excel(fd.getvalue(),['Sheet1'],[('Fecha Servicio',),('Estado Servicio',),('No.OrdenServicio','No. Orden Servicio')])
+        _,rp=leer_excel(fp.getvalue(),['ACTUALIZADO','BASE'],[('Fecha Servicio',),('REMESAS',),('Estado',),('No. Orden Servicio','SERVICIO')])
+        _,rt=leer_excel(ft.getvalue(),['ORDPLA_L01 (75)','Sheet1'],[('TRAYECTO','REMESA'),('ESTADO OPER','ESTADO OP'),('V.CLIENTE',)])
+        hojas=conciliar(preparar_data(rd),preparar_pat(rp,'ACTUALIZADO'),preparar_tray(rt))
+        op=hojas['BASE_SOLICITUDES'].copy();fin=hojas['BASE_MAESTRA_RCN'].copy();rev=hojas['REVISION_COORDINADOR'].copy()
+        st.success('Se reconstruyó la Base Maestra directamente desde las tres fuentes.')
+        st.download_button('📥 Descargar Base Maestra reconstruida',exportar(hojas),file_name='BASE_MAESTRA_RCN_ACTUALIZADA.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        legacy=False
+    else:
+        raw=f.getvalue();book=pd.ExcelFile(io.BytesIO(raw));legacy='BASE_SOLICITUDES' not in book.sheet_names
+        if not legacy:
+            op=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_SOLICITUDES')
+            fin=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_MAESTRA_RCN')
+            rev=pd.read_excel(io.BytesIO(raw),sheet_name='REVISION_COORDINADOR') if 'REVISION_COORDINADOR' in book.sheet_names else pd.DataFrame()
+        else:
+            if not {'CRUCE_DATA_PAT','BASE_MAESTRA_RCN'}.issubset(book.sheet_names):
+                st.error('El libro no contiene CRUCE_DATA_PAT y BASE_MAESTRA_RCN. Carga los tres originales para reconstruirlo.')
+                st.stop()
+            op=pd.read_excel(io.BytesIO(raw),sheet_name='CRUCE_DATA_PAT')
+            fin=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_MAESTRA_RCN')
+            rev=pd.DataFrame()
+            st.warning('MODO HISTÓRICO: se muestran las gráficas disponibles, pero el archivo antiguo NO permite validar resultados finales PAT ni conflictos SEV. Para cifras finales carga los tres originales en el recuadro de reconstrucción.')
+except Exception as exc:
+    st.error('Error al leer o conciliar los archivos.');st.exception(exc);st.stop()
 
-    **Importante:** cambiar el nombre de un archivo V8 a V9 no lo convierte; es necesario volver a procesar las tres fuentes.''')
-    st.stop()
-try:
-    op=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_SOLICITUDES')
-    fin=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_MAESTRA_RCN')
-    rev=pd.read_excel(io.BytesIO(raw),sheet_name='REVISION_COORDINADOR')
-    columnas_op=['DATA_FECHA_SERVICIO','DATA_CANCELADO','COINCIDE_PAT','EJECUCION_CONFIRMADA_ASTRANS','DATA_CENTRO_ORDEN_COSTO']
-    columnas_fin=['ASTRANS_FECHA_SERVICIO','ASTRANS_FECHA_CARGA','V_CLIENTE_NUM','V_CONDUCT_NUM','MARGEN_CALCULADO','ES_EJECUCION_VALIDA','ES_ANULADO','ES_CIERRE_PENDIENTE','CENTRO_COSTO_CONCILIADO']
-    faltan_op=[c for c in columnas_op if c not in op.columns]
-    faltan_fin=[c for c in columnas_fin if c not in fin.columns]
-    if faltan_op or faltan_fin:
-        st.error('El archivo tiene las hojas V9, pero faltan columnas obligatorias para el informe.')
-        if faltan_op:st.write('**BASE_SOLICITUDES:** '+', '.join(f'`{c}`' for c in faltan_op))
-        if faltan_fin:st.write('**BASE_MAESTRA_RCN:** '+', '.join(f'`{c}`' for c in faltan_fin))
-        st.info('Vuelve a generar el libro usando la Data Factory V9 incluida en el mismo paquete que este informe.')
-        st.stop()
-    for c in ['V_CLIENTE_NUM','V_CONDUCT_NUM','MARGEN_CALCULADO']:
-        fin[c]=pd.to_numeric(fin[c],errors='coerce').fillna(0)
-    for c in ['DATA_CANCELADO','COINCIDE_PAT','EJECUCION_CONFIRMADA_ASTRANS']:
-        op[c]=op[c].fillna(False).astype(bool)
-    for c in ['ES_EJECUCION_VALIDA','ES_ANULADO','ES_CIERRE_PENDIENTE']:
-        fin[c]=fin[c].fillna(False).astype(bool)
-    op=periodos(op,'DATA_FECHA_SERVICIO')
-    fin=periodos(fin,'ASTRANS_FECHA_SERVICIO')
-    fin['MES_CARGA']=pd.to_datetime(fin.ASTRANS_FECHA_CARGA,errors='coerce').dt.strftime('%Y-%m')
-except Exception as e:
-    st.error('No fue posible preparar la Base Maestra V9 para el informe. Comprueba que se haya generado completamente.')
-    with st.expander('Ver detalle técnico'):
-        st.exception(e)
-    st.stop()
+# Normalizar estructuras antiguas sin atribuir estados finales no verificables.
+if legacy:
+    if 'DATA_FECHA_SERVICIO' not in op.columns:st.error('No se encontró DATA_FECHA_SERVICIO.');st.stop()
+    op['DATA_CANCELADO']=op['DATA_ESTADO_SERVICIO'].fillna('').astype(str).str.upper().str.contains('CANCEL',na=False)
+    op['CLASE_INICIAL']=np.where(op.DATA_CANCELADO,'CANCELADO_INICIAL','GESTIONADO_INICIAL')
+    op['ESTADO_FINAL_SOLICITUD']='NO_CONCILIADO_HISTORICO'
+    op['EJECUCION_CONFIRMADA_ASTRANS']=False
+    op['PAT_TIENE_SEV']=False
+    op['ALERTA_CONCILIACION']=''
+    fin['ASTRANS_FECHA_SERVICIO']=pd.to_datetime(fin[first(fin,['ASTRANS_CARGA_FECHA','CARGA'])],errors='coerce',dayfirst=True)
+    fin['ASTRANS_FECHA_CARGA']=fin.ASTRANS_FECHA_SERVICIO
+    fin['V_CLIENTE_NUM']=pd.to_numeric(fin[first(fin,['V_CLIENTE_NUM','V.CLIENTE'])],errors='coerce').fillna(0)
+    fin['V_CONDUCT_NUM']=pd.to_numeric(fin[first(fin,['V_CONDUCT_NUM','V.CONDUCT'])],errors='coerce').fillna(0)
+    fin['MARGEN_CALCULADO']=fin.V_CLIENTE_NUM-fin.V_CONDUCT_NUM
+    fin['ASTRANS_REMESA_NORM']=fin[first(fin,['ASTRANS_REMESA_NORM','REMESA'])].fillna('').astype(str) if first(fin,['ASTRANS_REMESA_NORM','REMESA']) else ''
+    fin['ES_ANULADO']=fin[first(fin,['ASTRANS_ESTADO_OP_NORM','ESTADO OP'])].fillna('').astype(str).str.upper().eq('ANULADO') if first(fin,['ASTRANS_ESTADO_OP_NORM','ESTADO OP']) else False
+    fin['ES_EJECUCION_VALIDA']=~fin.ES_ANULADO
+    fin['ES_CIERRE_PENDIENTE']=False
+    fin['CENTRO_COSTO_CONCILIADO']=fin.get('DATA_CENTRO_ORDEN_COSTO',pd.Series('',index=fin.index)).fillna('')
+    fin['FUENTE_CENTRO_COSTO']='NO_CONCILIADO_HISTORICO'
+    fin['RESULTADO_SERVICIO']='HISTORICO_SIN_VALIDAR'
+    fin['ESTADO_TRAZABILIDAD']='NO_VALIDADO'
+for c in ['DATA_CANCELADO','EJECUCION_CONFIRMADA_ASTRANS','PAT_TIENE_SEV']:
+    op[c]=boolean(op[c]) if c in op else False
+for c in ['ES_ANULADO','ES_EJECUCION_VALIDA','ES_CIERRE_PENDIENTE']:
+    fin[c]=boolean(fin[c]) if c in fin else False
+for c in ['V_CLIENTE_NUM','V_CONDUCT_NUM','MARGEN_CALCULADO']:
+    fin[c]=pd.to_numeric(fin[c],errors='coerce').fillna(0)
+for c in ['DATA_CENTRO_ORDEN_COSTO','DATA_TIPO_VEHICULO','DATA_MODALIDAD','DATA_ORIGEN','DATA_DESTINO','DATA_ESTADO_SERVICIO','ESTADO_FINAL_SOLICITUD','ALERTA_CONCILIACION']:
+    if c not in op:op[c]=''
+for c in ['CENTRO_COSTO_CONCILIADO','FUENTE_CENTRO_COSTO','RESULTADO_SERVICIO','ESTADO_TRAZABILIDAD','ASTRANS_REMESA_NORM']:
+    if c not in fin:fin[c]=''
 
-# Los filtros se aplican sobre la misma llave de servicio o sobre el centro conciliado.
+op=periodo(op,'DATA_FECHA_SERVICIO');fin=periodo(fin,'ASTRANS_FECHA_SERVICIO')
+fin['MES_CARGA']=pd.to_datetime(fin.ASTRANS_FECHA_CARGA,errors='coerce',dayfirst=True).dt.strftime('%Y-%m')
 with st.sidebar:
-    st.header('🔎 Filtros')
-    meses=sorted(set(op.MES.dropna()) | set(fin.MES.dropna()))
-    elegidos=st.multiselect('Meses',meses,default=meses)
-    if not elegidos:elegidos=meses
+    st.header('🔎 Filtros del informe')
+    meses=sorted(set(op.MES.dropna().astype(str))|set(fin.MES.dropna().astype(str)))
+    sel_mes=st.multiselect('Meses',meses,default=meses)
+    if not sel_mes:sel_mes=meses
     periodicidad=st.selectbox('Periodicidad',['Mensual','Bimestral','Trimestral','Semestral'])
     pcol={'Mensual':'MES','Bimestral':'BIMESTRE','Trimestral':'TRIMESTRE','Semestral':'SEMESTRE'}[periodicidad]
-    centros=sorted(set(op.DATA_CENTRO_ORDEN_COSTO.dropna().astype(str)) | set(fin.CENTRO_COSTO_CONCILIADO.dropna().astype(str)))
-    centros=[c for c in centros if c and c.lower()!='nan']
-    centros_sel=st.multiselect('Centro / Orden de costo',centros)
-    tipo_fecha=st.radio('Fecha para análisis financiero',['Fecha del servicio','Fecha de carga'],index=0,help='La fecha del servicio permite comparar actividad; la fecha de carga sirve para conciliación administrativa.')
-    solo_conciliados=st.checkbox('Financiero: solo centros conciliados',value=False)
+    centros=sorted((set(op.DATA_CENTRO_ORDEN_COSTO.dropna().astype(str))|set(fin.CENTRO_COSTO_CONCILIADO.dropna().astype(str)))-{'','nan','None'})
+    sel_centro=st.multiselect('Centro de costo (selección múltiple)',centros)
+    sel_veh=st.multiselect('Tipo de vehículo DATA',sorted(set(op.DATA_TIPO_VEHICULO.dropna().astype(str)) - {'','nan'}))
+    sel_modal=st.multiselect('Modalidad DATA',sorted(set(op.DATA_MODALIDAD.dropna().astype(str)) - {'','nan'}))
+    fecha_fin=st.selectbox('Periodo financiero',['Fecha del servicio','Fecha de carga'])
+    solo_conciliado=st.checkbox('Solo centros financieros conciliados',value=False)
 
-op=op[op.MES.isin(elegidos)].copy()
-fin=fin[fin[('MES' if tipo_fecha=='Fecha del servicio' else 'MES_CARGA')].isin(elegidos)].copy()
-if centros_sel:
-    op=op[op.DATA_CENTRO_ORDEN_COSTO.astype(str).isin(centros_sel)].copy()
-    fin=fin[fin.CENTRO_COSTO_CONCILIADO.astype(str).isin(centros_sel)].copy()
-if solo_conciliados:fin=fin[fin.FUENTE_CENTRO_COSTO.ne('SIN_CONCILIAR')].copy()
-if tipo_fecha=='Fecha de carga':
-    fin=periodos(fin,'ASTRANS_FECHA_CARGA')
+op=op[op.MES.isin(sel_mes)].copy()
+fin=fin[fin[('MES' if fecha_fin=='Fecha del servicio' else 'MES_CARGA')].isin(sel_mes)].copy()
+if sel_centro:
+    op=op[op.DATA_CENTRO_ORDEN_COSTO.astype(str).isin(sel_centro)].copy()
+    fin=fin[fin.CENTRO_COSTO_CONCILIADO.astype(str).isin(sel_centro)].copy()
+if sel_veh:op=op[op.DATA_TIPO_VEHICULO.astype(str).isin(sel_veh)].copy()
+if sel_modal:op=op[op.DATA_MODALIDAD.astype(str).isin(sel_modal)].copy()
+if solo_conciliado:fin=fin[fin.FUENTE_CENTRO_COSTO.astype(str).isin(['DATA','PAT'])].copy()
+if fecha_fin=='Fecha de carga':fin=periodo(fin,'ASTRANS_FECHA_CARGA')
 
-op['ESTADO_FINAL_SOLICITUD']=op.ESTADO_FINAL_SOLICITUD.fillna('PENDIENTE_CONCILIACION')
-fin['RESULTADO_SERVICIO']=fin.RESULTADO_SERVICIO.fillna('REVISAR_ESTADO_ASTRANS')
-solicitudes=len(op)
-inicial_gestionados=int((~op.DATA_CANCELADO).sum())
-inicial_cancelados=int(op.DATA_CANCELADO.sum())
-final_cancelados=int(op.ESTADO_FINAL_SOLICITUD.isin(['CANCELADO_CONFIRMADO_PAT','CANCELADO_DATA_SIN_PAT']).sum())
-con_remesa=int(op.ESTADO_FINAL_SOLICITUD.isin(['PRESTADO_CON_REMESA','EJECUTADO_CONCILIADO']).sum())
-confirmados=int(op.EJECUCION_CONFIRMADA_ASTRANS.sum())
-pendientes=int(op.ESTADO_FINAL_SOLICITUD.eq('PENDIENTE_CONCILIACION').sum())
-valid_fin=fin[fin.ES_EJECUCION_VALIDA & ~fin.ES_ANULADO].copy()
-# No sumar remesas repetidas dos veces sin alertarlo: conservar detalle, usar una fila por remesa para KPIs.
-con_sev=valid_fin[valid_fin.ASTRANS_REMESA_NORM.fillna('').astype(str).ne('')].copy()
-con_sev['DUPLICADO_REMESA']=con_sev.duplicated('ASTRANS_REMESA_NORM',keep=False)
-fin_unico=con_sev.drop_duplicates('ASTRANS_REMESA_NORM',keep='first').copy()
-fin_sin_sev=valid_fin[valid_fin.ASTRANS_REMESA_NORM.fillna('').astype(str).eq('')].copy()
-# Registros sin remesa se conservan en control, pero NO se agregan al financiero verificado.
-importe=float(fin_unico.V_CLIENTE_NUM.sum());costo=float(fin_unico.V_CONDUCT_NUM.sum());margen=importe-costo
-n_ejecutados=len(fin_unico);ticket=importe/n_ejecutados if n_ejecutados else 0
+# KPI financiero: una remesa por código, sin contar duplicados ni anulados.
+valid=fin[fin.ES_EJECUCION_VALIDA & ~fin.ES_ANULADO].copy()
+valid['ASTRANS_REMESA_NORM']=valid.ASTRANS_REMESA_NORM.fillna('').astype(str)
+con_remesa=valid[valid.ASTRANS_REMESA_NORM.str.startswith('SEV')].copy()
+duplicados=con_remesa[con_remesa.duplicated('ASTRANS_REMESA_NORM',keep=False)].copy()
+fin_unico=con_remesa.drop_duplicates('ASTRANS_REMESA_NORM').copy()
+# Registros sin remesa se muestran en control, no se mezclan en el monto verificado.
+fin_sin_sev=valid[~valid.ASTRANS_REMESA_NORM.str.startswith('SEV')].copy()
+importe=fin_unico.V_CLIENTE_NUM.sum();costo=fin_unico.V_CONDUCT_NUM.sum();margen=importe-costo
+sol=len(op);inic_cancel=int(op.DATA_CANCELADO.sum());inic_gest=sol-inic_cancel
+fin_cancel=int(op.ESTADO_FINAL_SOLICITUD.isin(['CANCELADO_CONFIRMADO_PAT','CANCELADO_DATA_SIN_PAT']).sum()) if not legacy else None
+confirm=int(op.EJECUCION_CONFIRMADA_ASTRANS.sum()) if not legacy else None
+sev_pat=int(op.PAT_TIENE_SEV.sum()) if not legacy else None
+st.subheader('Indicadores gerenciales')
+for cols,items in [(st.columns(6),[('Solicitudes DATA',fmt(sol)),('Gestionadas iniciales',fmt(inic_gest)),('Canceladas DATA',fmt(inic_cancel)),('Canceladas finales',fmt(fin_cancel) if fin_cancel is not None else 'N/D'),('Con SEV en PAT',fmt(sev_pat) if sev_pat is not None else 'N/D'),('Ejecutadas conciliadas',fmt(confirm) if confirm is not None else 'N/D')]),(st.columns(6),[('Remesas únicas ASTRANS',fmt(len(fin_unico))),('Facturación',cop(importe)),('Costos',cop(costo)),('Margen',cop(margen)),('Rentabilidad',pct(margen/importe*100 if importe else 0)),('Ticket promedio',cop(importe/len(fin_unico) if len(fin_unico) else 0))])]:
+    for c,(k,v) in zip(cols,items):c.metric(k,v)
+st.caption('El volumen DATA representa solicitudes; PAT registra resultado; TRAYECTOS aporta remesas y valores. Las cifras financieras mostradas excluyen anulados y duplicados de remesa, sujetos a revisión.')
 
-st.subheader('Indicadores principales')
-a=st.columns(6)
-for box,label,val in zip(a,['Solicitudes DATA','Gestionados iniciales','Cancelados DATA','Cancelados finales','Con remesa PAT','Ejecutados conciliados'],
-                         [solicitudes,inicial_gestionados,inicial_cancelados,final_cancelados,con_remesa,confirmados]):box.metric(label,fmt(val))
-b=st.columns(6)
-for box,label,val in zip(b,['Pendientes','Remesas ejecutadas únicas','Facturación verificada','Costos','Margen','Rentabilidad'],
-                         [fmt(pendientes),fmt(n_ejecutados),cop(importe),cop(costo),cop(margen),pct(100*margen/importe if importe else 0)]):box.metric(label,val)
-st.caption('Cancelaciones finales = cancelado PAT o cancelado DATA sin PAT. Una remesa SEV prevalece sobre Estado Cancelado en PAT. Los servicios PAT sin confirmación ASTRANS se muestran aparte.')
-
-op_mes=op.groupby(pcol,as_index=False).agg(SOLICITUDES=('DATA_ID','count'),GESTIONADOS_INICIALES=('DATA_CANCELADO',lambda x:(~x).sum()),CANCELADOS_INICIALES=('DATA_CANCELADO','sum'),CANCELADOS_FINALES=('ESTADO_FINAL_SOLICITUD',lambda x:x.isin(['CANCELADO_CONFIRMADO_PAT','CANCELADO_DATA_SIN_PAT']).sum()),CON_REMESA_PAT=('ESTADO_FINAL_SOLICITUD',lambda x:x.isin(['PRESTADO_CON_REMESA','EJECUTADO_CONCILIADO']).sum()),EJECUTADOS_CONCILIADOS=('EJECUCION_CONFIRMADA_ASTRANS','sum')).sort_values(pcol)
-op_mes['TASA_CANCELACION_FINAL_%']=np.where(op_mes.SOLICITUDES.gt(0),op_mes.CANCELADOS_FINALES/op_mes.SOLICITUDES*100,0)
-op_mes['VAR_SOLICITUDES_%']=op_mes.SOLICITUDES.pct_change()*100
-fin_mes=fin_unico.groupby(pcol,as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum'),MARGEN=('MARGEN_CALCULADO','sum')).sort_values(pcol)
-fin_mes['RENTABILIDAD_%']=np.where(fin_mes.FACTURACION.ne(0),fin_mes.MARGEN/fin_mes.FACTURACION*100,0)
+op['ES_CANCELACION_FINAL']=op.ESTADO_FINAL_SOLICITUD.isin(['CANCELADO_CONFIRMADO_PAT','CANCELADO_DATA_SIN_PAT'])
+op['CON_SEV_PAT']=op.PAT_TIENE_SEV
+op_mes=op.groupby(pcol,as_index=False).agg(SOLICITUDES=('DATA_CANCELADO','size'),GESTIONADAS=('DATA_CANCELADO',lambda s:(~s).sum()),CANCELADAS_DATA=('DATA_CANCELADO','sum'),CANCELADAS_FINALES=('ES_CANCELACION_FINAL','sum'),CON_SEV_PAT=('CON_SEV_PAT','sum'),EJECUTADAS_CONCILIADAS=('EJECUCION_CONFIRMADA_ASTRANS','sum')).rename(columns={pcol:'PERIODO'}).sort_values('PERIODO')
+for m in ['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA','CANCELADAS_FINALES','CON_SEV_PAT','EJECUTADAS_CONCILIADAS']:
+    op_mes['VAR_'+m+'_%']=op_mes[m].pct_change(fill_method=None)*100
+op_mes['TASA_CANCEL_DATA_%']=np.where(op_mes.SOLICITUDES>0,op_mes.CANCELADAS_DATA/op_mes.SOLICITUDES*100,0)
+op_mes['TASA_CANCEL_FINAL_%']=np.where(op_mes.SOLICITUDES>0,op_mes.CANCELADAS_FINALES/op_mes.SOLICITUDES*100,0)
+fin_mes=fin_unico.groupby(pcol,as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum')).rename(columns={pcol:'PERIODO'}).sort_values('PERIODO')
+fin_mes['MARGEN']=fin_mes.FACTURACION-fin_mes.COSTOS
+fin_mes['MARGEN_%']=np.where(fin_mes.FACTURACION.ne(0),fin_mes.MARGEN/fin_mes.FACTURACION*100,0)
 fin_mes['TICKET_PROMEDIO']=np.where(fin_mes.REMESAS.ne(0),fin_mes.FACTURACION/fin_mes.REMESAS,0)
-fin_mes['VAR_FACTURACION_%']=fin_mes.FACTURACION.pct_change()*100
+for m in ['REMESAS','FACTURACION','COSTOS','MARGEN','TICKET_PROMEDIO']:
+    fin_mes['VAR_'+m+'_%']=fin_mes[m].pct_change(fill_method=None)*100
 
-names=['🏢 Resumen ejecutivo','📋 Estado inicial DATA','🔗 Resultado PAT','❌ Cancelaciones','📈 Evolución operativa','🚚 Ejecución ASTRANS','💰 Financiero','🎬 Centros de costo','🚙 Vehículos / rutas','⚠️ Conciliación','📥 Exportar']
+names=['🏢 Resumen ejecutivo','📋 DATA estados','🔗 PAT y conciliación','❌ Cancelaciones','📈 Producción y variaciones','💰 Financiero','🎬 Centros de costo','🚙 Vehículo y modalidad','🗺 Mapas de calor','⚠️ Trazabilidad','📥 Exportar']
 tabs=st.tabs(names)
 with tabs[0]:
     c1,c2=st.columns(2)
-    with c1:st.plotly_chart(bar(op_mes,pcol,'SOLICITUDES','Demanda inicial '+periodicidad.lower()),use_container_width=True)
-    with c2:st.plotly_chart(bar(fin_mes,pcol,'FACTURACION','Facturación verificada '+periodicidad.lower(),color='#F58220'),use_container_width=True)
-    st.dataframe(op_mes.merge(fin_mes,on=pcol,how='outer').sort_values(pcol),use_container_width=True,hide_index=True)
-    st.markdown(f'**Lectura ejecutiva:** {fmt(solicitudes)} solicitudes iniciales; {fmt(final_cancelados)} cancelaciones finales identificadas; {fmt(confirmados)} solicitudes vinculadas a ejecución ASTRANS; {fmt(n_ejecutados)} remesas ejecutadas únicas en el alcance financiero; facturación {cop(importe)} y margen {cop(margen)}. Las cifras operativas y financieras tienen universos diferentes y no deben restarse sin conciliación.')
+    with c1:st.plotly_chart(barras(op_mes,'PERIODO','SOLICITUDES','Solicitudes iniciales y variación'),use_container_width=True)
+    with c2:st.plotly_chart(barras(fin_mes,'PERIODO','FACTURACION','Facturación y variación',moneda=True,color='#F58220'),use_container_width=True)
+    st.plotly_chart(linea(op_mes,'PERIODO',['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA'],'Demanda, gestión y cancelaciones iniciales'),use_container_width=True)
+    st.dataframe(op_mes.merge(fin_mes,on='PERIODO',how='outer'),hide_index=True,use_container_width=True)
+    st.info('Una reducción de solicitudes por producción puede corresponder al cierre natural del proyecto audiovisual. No se considera cancelación sin evidencia del estado. Los montos por centro solo se atribuyen cuando hay conciliación.')
 with tabs[1]:
-    d=op.groupby('DATA_ESTADO_SERVICIO',dropna=False).size().reset_index(name='CANTIDAD').sort_values('CANTIDAD',ascending=False)
-    st.plotly_chart(bar(d,'DATA_ESTADO_SERVICIO','CANTIDAD','Estados iniciales DATA'),use_container_width=True)
-    st.dataframe(d,use_container_width=True,hide_index=True)
-with tabs[2]:
-    d=op.groupby('ESTADO_FINAL_SOLICITUD',dropna=False).size().reset_index(name='CANTIDAD').sort_values('CANTIDAD',ascending=False)
-    st.plotly_chart(bar(d,'ESTADO_FINAL_SOLICITUD','CANTIDAD','Resultado de solicitud tras cruce DATA–PAT–ASTRANS'),use_container_width=True)
-    st.dataframe(d,use_container_width=True,hide_index=True)
-    st.info('PRESTADO_CON_REMESA: PAT contiene SEV, pero no se confirmó una remesa ejecutada válida en ASTRANS. No equivale a facturación confirmada.')
-with tabs[3]:
-    d=op_mes[[pcol,'CANCELADOS_INICIALES','CANCELADOS_FINALES','TASA_CANCELACION_FINAL_%']]
-    st.plotly_chart(px.bar(d,x=pcol,y=['CANCELADOS_INICIALES','CANCELADOS_FINALES'],barmode='group',title='Cancelaciones DATA vs resultado conciliado'),use_container_width=True)
-    st.dataframe(d,use_container_width=True,hide_index=True)
-    ca=op[op.ESTADO_FINAL_SOLICITUD.isin(['CANCELADO_CONFIRMADO_PAT','CANCELADO_DATA_SIN_PAT'])]
-    st.dataframe(ca.groupby('DATA_CENTRO_ORDEN_COSTO').size().reset_index(name='CANCELADOS').sort_values('CANCELADOS',ascending=False).head(25),hide_index=True,use_container_width=True)
-with tabs[4]:
-    d=op_mes[[pcol,'SOLICITUDES','GESTIONADOS_INICIALES','CON_REMESA_PAT','EJECUTADOS_CONCILIADOS']]
-    st.plotly_chart(px.line(d,x=pcol,y=['SOLICITUDES','GESTIONADOS_INICIALES','CON_REMESA_PAT','EJECUTADOS_CONCILIADOS'],markers=True,title='Embudo operativo por periodo'),use_container_width=True)
-    st.dataframe(d,hide_index=True,use_container_width=True)
-with tabs[5]:
-    d=fin.groupby('RESULTADO_SERVICIO').size().reset_index(name='REGISTROS')
-    st.plotly_chart(bar(d,'RESULTADO_SERVICIO','REGISTROS','Estados de ejecución ASTRANS'),use_container_width=True)
-    st.plotly_chart(bar(fin_mes,pcol,'REMESAS','Remesas únicas ejecutadas'),use_container_width=True)
-    st.caption(f'Registros ASTRANS sin remesa SEV: {len(fin_sin_sev)} · Filas duplicadas por remesa dentro del conjunto válido: {int(con_sev.DUPLICADO_REMESA.sum())}. Se excluyen del agregado verificado para evitar doble conteo; deben revisarse antes de cerrar valores.')
-with tabs[6]:
     c1,c2=st.columns(2)
-    with c1:st.plotly_chart(bar(fin_mes,pcol,'FACTURACION','Facturación',color='#003B75'),use_container_width=True)
-    with c2:st.plotly_chart(bar(fin_mes,pcol,'MARGEN','Margen',color='#008A3D'),use_container_width=True)
+    with c1:st.plotly_chart(donut(op,'DATA_ESTADO_SERVICIO','Estados iniciales DATA'),use_container_width=True)
+    with c2:st.plotly_chart(barras(op_mes,'PERIODO','GESTIONADAS','Gestión inicial y variación'),use_container_width=True)
+    st.dataframe(op.groupby('DATA_ESTADO_SERVICIO',dropna=False).size().reset_index(name='CANTIDAD').sort_values('CANTIDAD',ascending=False),hide_index=True,use_container_width=True)
+with tabs[2]:
+    if legacy:st.warning('No se puede certificar el estado PAT final usando únicamente la base antigua. Reconstruye con las tres fuentes.')
+    else:
+        c1,c2=st.columns(2)
+        with c1:st.plotly_chart(donut(op,'ESTADO_FINAL_SOLICITUD','Resultado final por solicitud'),use_container_width=True)
+        with c2:st.plotly_chart(barras(op_mes,'PERIODO','CON_SEV_PAT','Servicios con remesa SEV'),use_container_width=True)
+        st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS','CANCELADAS_FINALES'],'Remesa PAT, ejecución conciliada y cancelaciones'),use_container_width=True)
+        st.dataframe(op.groupby('ESTADO_FINAL_SOLICITUD',dropna=False).size().reset_index(name='CANTIDAD'),hide_index=True,use_container_width=True)
+with tabs[3]:
+    c1,c2=st.columns(2)
+    with c1:st.plotly_chart(barras(op_mes,'PERIODO','CANCELADAS_DATA','Cancelaciones iniciales y variación',color='#D43D3D'),use_container_width=True)
+    with c2:
+        st.plotly_chart(px.line(op_mes,x='PERIODO',y='TASA_CANCEL_DATA_%',markers=True,text='TASA_CANCEL_DATA_%',title='Tasa de cancelación DATA (%)'),use_container_width=True)
+    if not legacy:
+        st.plotly_chart(px.bar(op_mes,x='PERIODO',y=['CANCELADAS_DATA','CANCELADAS_FINALES'],barmode='group',title='Cancelaciones iniciales vs finales PAT'),use_container_width=True)
+        st.plotly_chart(pareto(op[op.ES_CANCELACION_FINAL],'DATA_CENTRO_ORDEN_COSTO','Pareto de cancelaciones finales por centro'),use_container_width=True)
+    st.dataframe(op_mes,hide_index=True,use_container_width=True)
+with tabs[4]:
+    st.plotly_chart(linea(op_mes,'PERIODO',['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA'],'Evolución de la producción operativa'),use_container_width=True)
+    if not legacy:st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS'],'SEV y ejecución conciliada'),use_container_width=True)
+    st.plotly_chart(barras(fin_mes,'PERIODO','REMESAS','Remesas ejecutadas y variación'),use_container_width=True)
+    st.dataframe(op_mes,hide_index=True,use_container_width=True)
+with tabs[5]:
+    c1,c2=st.columns(2)
+    with c1:st.plotly_chart(barras(fin_mes,'PERIODO','FACTURACION','Facturación y variación',moneda=True),use_container_width=True)
+    with c2:st.plotly_chart(barras(fin_mes,'PERIODO','MARGEN','Margen y variación',moneda=True,color='#008A3D'),use_container_width=True)
+    st.plotly_chart(linea(fin_mes,'PERIODO',['FACTURACION','COSTOS','MARGEN'],'Facturación, costos y margen'),use_container_width=True)
+    st.plotly_chart(linea(fin_mes,'PERIODO',['MARGEN_%'],'Rentabilidad mensual (%)'),use_container_width=True)
     st.dataframe(fin_mes,hide_index=True,use_container_width=True)
-    st.metric('Ticket promedio por remesa',cop(ticket))
-with tabs[7]:
-    opcent=op.groupby([pcol,'DATA_CENTRO_ORDEN_COSTO'],as_index=False).size().rename(columns={'size':'SOLICITUDES'})
-    top=op.groupby('DATA_CENTRO_ORDEN_COSTO').size().nlargest(12).index
-    d=opcent[opcent.DATA_CENTRO_ORDEN_COSTO.isin(top)]
-    st.plotly_chart(px.line(d,x=pcol,y='SOLICITUDES',color='DATA_CENTRO_ORDEN_COSTO',markers=True,title='Demanda inicial por centro de costo'),use_container_width=True)
+with tabs[6]:
+    st.plotly_chart(pareto(op,'DATA_CENTRO_ORDEN_COSTO','Pareto solicitudes por centro'),use_container_width=True)
+    top=op.DATA_CENTRO_ORDEN_COSTO.value_counts().head(12).index
+    evol=op[op.DATA_CENTRO_ORDEN_COSTO.isin(top)].groupby(['MES','DATA_CENTRO_ORDEN_COSTO']).size().reset_index(name='SOLICITUDES')
+    if not evol.empty:
+        malla=pd.MultiIndex.from_product([sorted(op.MES.dropna().unique()),list(top)],names=['MES','DATA_CENTRO_ORDEN_COSTO']).to_frame(index=False)
+        evol=malla.merge(evol,on=['MES','DATA_CENTRO_ORDEN_COSTO'],how='left').fillna({'SOLICITUDES':0})
+        fig=px.line(evol,x='MES',y='SOLICITUDES',color='DATA_CENTRO_ORDEN_COSTO',markers=True,title='Evolución mensual por centro de costo (top 12)')
+        fig.update_layout(height=540,xaxis_type='category');st.plotly_chart(fig,use_container_width=True)
     st.dataframe(op.groupby('DATA_CENTRO_ORDEN_COSTO').size().reset_index(name='SOLICITUDES').sort_values('SOLICITUDES',ascending=False).head(30),hide_index=True,use_container_width=True)
-    fcent=fin_unico[fin_unico.FUENTE_CENTRO_COSTO.ne('SIN_CONCILIAR')]
-    st.subheader('Facturación por centro conciliado')
-    st.dataframe(fcent.groupby('CENTRO_COSTO_CONCILIADO',as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),MARGEN=('MARGEN_CALCULADO','sum')).sort_values('FACTURACION',ascending=False).head(30),hide_index=True,use_container_width=True)
-    st.caption(f'{len(fin_unico)-len(fcent)} remesas ejecutadas únicas carecen de centro de costo conciliado. No se asigna facturación a un centro por inferencia.')
+    fcent=fin_unico[fin_unico.FUENTE_CENTRO_COSTO.isin(['DATA','PAT'])]
+    if not fcent.empty:
+        st.subheader('Financiero por centro conciliado')
+        st.dataframe(fcent.groupby('CENTRO_COSTO_CONCILIADO',as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum'),MARGEN=('MARGEN_CALCULADO','sum')).sort_values('FACTURACION',ascending=False),hide_index=True,use_container_width=True)
+    st.caption(f'Remesas únicas sin centro de costo conciliado: {len(fin_unico)-len(fcent)}. No se asignan ingresos a producciones por suposición.')
+with tabs[7]:
+    v=first(fin_unico,['T. VEHICULO','T.VEHICULO','T VEHICULO'])
+    m=first(fin_unico,['T.NEGOCIO','TRAY. PROP','LINEA NEG'])
+    c1,c2=st.columns(2)
+    with c1:
+        if v:st.plotly_chart(donut(fin_unico,v,'Tipo de vehículo ejecutado'),use_container_width=True)
+        else:st.plotly_chart(donut(op,'DATA_TIPO_VEHICULO','Tipo de vehículo solicitado'),use_container_width=True)
+    with c2:
+        if m:st.plotly_chart(donut(fin_unico,m,'Modalidad / negocio'),use_container_width=True)
+        else:st.plotly_chart(donut(op,'DATA_MODALIDAD','Modalidad solicitada'),use_container_width=True)
+    if 'PLACA' in fin_unico:st.dataframe(fin_unico.groupby('PLACA').size().reset_index(name='REMESAS').sort_values('REMESAS',ascending=False).head(20),hide_index=True,use_container_width=True)
 with tabs[8]:
-    veh='T. VEHICULO' if 'T. VEHICULO' in fin_unico else None
-    if veh:
-        d=fin_unico.groupby(veh).size().reset_index(name='SERVICIOS').sort_values('SERVICIOS',ascending=False).head(15)
-        st.plotly_chart(bar(d,veh,'SERVICIOS','Participación de flota por vehículo'),use_container_width=True)
-    if 'ORIGEN' in fin_unico and 'DESTINO' in fin_unico:
-        od=fin_unico.groupby(['ORIGEN','DESTINO']).size().reset_index(name='SERVICIOS').sort_values('SERVICIOS',ascending=False).head(20)
-        st.dataframe(od,use_container_width=True,hide_index=True)
+    origen=first(fin_unico,['ORIGEN','ASTRANS_ORIGEN']);destino=first(fin_unico,['DESTINO','ASTRANS_DESTINO'])
+    fig=mapa_calor(fin_unico,origen,destino,'Mapa de calor de rutas ejecutadas — Origen × Destino')
+    if fig:st.plotly_chart(fig,use_container_width=True)
+    else:st.info('No hay suficientes orígenes y destinos en los registros ejecutados seleccionados.')
+    fig2=mapa_calor(op,'DATA_ORIGEN','DATA_DESTINO','Mapa de calor de solicitudes — Origen × Destino')
+    if fig2:st.plotly_chart(fig2,use_container_width=True)
+    if origen and destino and not fin_unico.empty:
+        st.dataframe(fin_unico.groupby([origen,destino]).size().reset_index(name='REMESAS').sort_values('REMESAS',ascending=False).head(30),hide_index=True,use_container_width=True)
 with tabs[9]:
-    if centros_sel:
-        revf=rev[rev.get('CENTRO',pd.Series('',index=rev.index)).astype(str).isin(centros_sel)].copy()
-    else:revf=rev.copy()
-    st.metric('Casos para coordinador',len(revf))
-    st.dataframe(revf,use_container_width=True,hide_index=True)
-    st.subheader('Cobertura de trazabilidad financiera')
-    st.dataframe(fin.groupby('ESTADO_TRAZABILIDAD').size().reset_index(name='FILAS'),hide_index=True,use_container_width=True)
-    st.warning('La alerta SEV + Cancelado no elimina el servicio: se cuenta como prestado con inconsistencia y requiere ajuste del estado PAT. No se modifican fuentes originales.')
+    st.metric('Casos para coordinador',len(rev))
+    if not rev.empty:st.dataframe(rev,use_container_width=True,hide_index=True)
+    else:st.info('Sin alertas disponibles en el libro seleccionado.')
+    if not fin.empty:st.dataframe(fin.groupby('ESTADO_TRAZABILIDAD').size().reset_index(name='FILAS'),hide_index=True,use_container_width=True)
+    st.metric('Remesas duplicadas en registros ejecutados',len(duplicados))
+    st.metric('Registros ejecutados sin remesa SEV',len(fin_sin_sev))
+    if not duplicados.empty:st.dataframe(duplicados,hide_index=True,use_container_width=True)
+    st.warning('SEV prevalece sobre Estado Cancelado de PAT. El caso debe corregirse con el coordinador, sin alterar el registro original.')
 with tabs[10]:
-    hojas={'RESUMEN_OPERATIVO':op_mes,'RESUMEN_FINANCIERO':fin_mes,'SOLICITUDES_FILTRADAS':op,'TRAYECTOS_FILTRADOS':fin,'REMESAS_EJECUTADAS':fin_unico,'REVISION_COORDINADOR':rev}
-    st.download_button('📥 Descargar informe ejecutivo conciliado',exportar(hojas),file_name='RCN_INFORME_EJECUTIVO_V9.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
-    st.markdown('**Interpretación:** una caída de solicitudes por centro de costo puede estar relacionada con el cierre de producción, pero no se atribuye automáticamente sin confirmar el cronograma. Cancelación inicial, cancelación final, remesa registrada y ejecución financiera se muestran como indicadores separados.')
+    hojas_export={'RESUMEN_OPERATIVO':op_mes,'RESUMEN_FINANCIERO':fin_mes,'SOLICITUDES_FILTRADAS':op,'TRAYECTOS_FILTRADOS':fin,'REMESAS_UNICAS':fin_unico,'REVISION_COORDINADOR':rev,'REMESAS_DUPLICADAS':duplicados,'SIN_SEV':fin_sin_sev}
+    st.download_button('📥 Descargar informe ejecutivo Excel',exportar(hojas_export),file_name='RCN_INFORME_EJECUTIVO_V10.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
+    st.caption('Las variaciones comparan periodos seleccionados consecutivos. Cuando se filtran meses no contiguos, se comparan únicamente los periodos visibles.')
