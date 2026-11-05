@@ -1,4 +1,4 @@
-"""RCN Informe Ejecutivo V11.2. Ejecutar: streamlit run app.py"""
+"""RCN Informe Ejecutivo V11.4. Ejecutar: streamlit run app.py"""
 import io, re, unicodedata
 import numpy as np
 import pandas as pd
@@ -233,9 +233,9 @@ def exportar(hojas):
 # INFORME EJECUTIVO V10: lectura flexible, sin bloqueo por versión.
 # ================================================================
 from datetime import datetime
-st.set_page_config(page_title='RCN Informe Ejecutivo V11.2',page_icon='📊',layout='wide')
+st.set_page_config(page_title='RCN Informe Ejecutivo V11.4',page_icon='📊',layout='wide')
 st.markdown('''<style>.block-container{padding-top:1rem}h1,h2,h3{color:#003B75!important}div[data-testid="stMetric"]{border:1px solid #dce3ef;border-radius:10px;padding:9px}div[data-testid="stDataFrame"]{font-size:12px}</style>''',unsafe_allow_html=True)
-st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V11.2')
+st.title('📊 RCN | Informe Ejecutivo Operativo y Financiero V11.4')
 st.caption('Demanda DATA · Resultado PAT · Ejecución TRAYECTOS · Variaciones · Rentabilidad · Calidad de datos')
 
 def fmt(x):
@@ -611,6 +611,12 @@ if not pat_detalle.empty:
 else:
     pat_mes=pd.DataFrame(columns=['PERIODO','GESTIONADOS_PAT','CANCELADOS_PAT','TOTAL_PAT','CON_SEV_PAT'])
 comparativo_pat=op_mes[['PERIODO','SOLICITUDES','CANCELADAS_DATA']].merge(pat_mes,on='PERIODO',how='outer').sort_values('PERIODO')
+# Validación explícita de cobertura: nunca presentar como cero una serie PAT ausente.
+if pat_detalle.empty:
+    st.error('NO SE ENCONTRARON REGISTROS PAT. El gráfico no puede comparar cancelaciones reales. Carga la Base Maestra actualizada con DETALLE_PAT o reconstruye con los tres archivos originales.')
+else:
+    st.caption(f'Fuente PAT detectada: {len(pat_detalle):,} filas para el filtro seleccionado; {pat_solicitudes.LLAVE_DATA_PAT.nunique():,} solicitudes únicas. Las cancelaciones PAT se determinan por ESTADO + REMESAS; SEV prevalece.')
+# La serie PAT es N/D donde no existe cobertura; no sustituir NaN por cero.
 comparativo_pat['TASA_CANCELACION_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.CANCELADOS_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
 comparativo_pat['COBERTURA_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.TOTAL_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
 fin_mes=fin_unico.groupby(pcol,as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum')).rename(columns={pcol:'PERIODO'}).sort_values('PERIODO')
@@ -659,9 +665,18 @@ with tabs[4]:
             comparativo_pat,[('CANCELADAS_DATA','Cancelaciones iniciales DATA'),('CANCELADOS_PAT','Cancelaciones reales PAT')],
             'Cancelaciones iniciales vs reales y variación mensual'),use_container_width=True)
     with c2:
-        st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%'],'Tasa de cancelación inicial DATA (%)',porcentaje=True),use_container_width=True)
+        if pat_detalle.empty:
+            st.warning('Cancelaciones PAT: SIN DATOS. No se dibujan barras ficticias de valor cero.')
+        else:
+            vista_pat=comparativo_pat[['PERIODO','CANCELADOS_PAT','CANCELADAS_DATA']].copy()
+            st.plotly_chart(linea(vista_pat,'PERIODO',['CANCELADAS_DATA','CANCELADOS_PAT'],
+                'Tendencia: cancelaciones DATA vs PAT'),use_container_width=True)
+    if not pat_detalle.empty:
+        pat_periodos=pat_mes['PERIODO'].dropna().astype(str).tolist()
+        st.info('PAT disponible en los periodos: '+', '.join(pat_periodos)+'. En los demás periodos la serie PAT es N/D, no cero.')
+
     if not legacy:
-        st.plotly_chart(comparativo_barras(op_mes,[('CANCELADAS_DATA','Canceladas inicialmente DATA'),('CANCELADAS_FINALES','Canceladas finales conciliadas')],'Seguimiento de cancelaciones iniciales vs finales'),use_container_width=True)
+        st.plotly_chart(comparativo_barras(op_mes,[('CANCELADAS_DATA','Canceladas inicialmente DATA'),('CANCELADAS_FINALES','Canceladas finales conciliadas')],'DATA inicial vs resultado conciliado (incluye DATA sin PAT: no equivale a cancelaciones reales PAT)'),use_container_width=True)
         st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%','TASA_CANCEL_FINAL_%'],'Evolución de tasas de cancelación (%)',porcentaje=True),use_container_width=True)
         st.plotly_chart(pareto(op[op.ES_CANCELACION_FINAL],'DATA_CENTRO_ORDEN_COSTO','Pareto de cancelaciones finales por centro'),use_container_width=True)
     tabla_cancel=comparativo_pat[['PERIODO','SOLICITUDES','CANCELADAS_DATA','CANCELADOS_PAT','TASA_CANCELACION_PAT_%']].copy()
@@ -723,8 +738,21 @@ with tabs[8]:
     if not evol.empty:
         malla=pd.MultiIndex.from_product([sorted(op.MES.dropna().unique()),list(top)],names=['MES','DATA_CENTRO_ORDEN_COSTO']).to_frame(index=False)
         evol=malla.merge(evol,on=['MES','DATA_CENTRO_ORDEN_COSTO'],how='left').fillna({'SOLICITUDES':0})
-        fig=px.line(evol,x='MES',y='SOLICITUDES',color='DATA_CENTRO_ORDEN_COSTO',markers=True,title='Evolución mensual por centro de costo (top 12)')
-        estilo(fig,'Evolución mensual por centro de costo (top 12)',580);ejes_meses(fig,evol,'MES');st.plotly_chart(fig,use_container_width=True)
+        st.caption('Los valores corresponden a solicitudes iniciales de DATA RCN. La tabla inferior incluye explícitamente los ceros.')
+        mostrar_valores=st.checkbox('Mostrar cantidades sobre los puntos de la gráfica',value=True,key='valores_centros')
+        seleccion=st.multiselect('Centros de costo visibles en la gráfica',options=list(top),default=list(top[:6]),key='centros_visibles',help='Selecciona menos centros para que las etiquetas numéricas no se superpongan. La tabla mantiene todos los centros.')
+        evol_graf=evol[evol['DATA_CENTRO_ORDEN_COSTO'].isin(seleccion)].copy()
+        if not evol_graf.empty:
+            evol_graf['ETIQUETA']=evol_graf['SOLICITUDES'].apply(lambda n: str(int(n)) if n>0 else '0')
+            fig=px.line(evol_graf,x='MES',y='SOLICITUDES',color='DATA_CENTRO_ORDEN_COSTO',markers=True,text='ETIQUETA' if mostrar_valores else None,title='Evolución mensual por centro de costo (top 12)')
+            if mostrar_valores:
+                fig.update_traces(textposition='top center',textfont=dict(size=10,color='#15243A'),cliponaxis=False)
+            estilo(fig,'Evolución mensual por centro de costo (top 12)',660)
+            fig.update_layout(margin=dict(t=80,b=75,l=55,r=25),legend=dict(font=dict(color='#172B4D',size=11)))
+            ejes_meses(fig,evol_graf,'MES')
+            st.plotly_chart(fig,use_container_width=True)
+        else:
+            st.info('Selecciona al menos un centro de costo para visualizar su evolución.')
     st.subheader('Tabla de evolución por producción — incluye meses con cero solicitudes')
     st.caption('0 = ninguna solicitud registrada para esa producción en el mes; no significa necesariamente que se perdió el cliente.')
     tabla_centros=tabla_mensual_completa(op,'MES','DATA_CENTRO_ORDEN_COSTO','SOLICITUDES',sorted(op.MES.dropna().unique()),top=20)
