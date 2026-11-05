@@ -60,18 +60,47 @@ def exportar(hojas):
                 for i,c in enumerate(d.columns):ws.write(0,i,c,fmt_head);ws.set_column(i,i,min(36,max(15,len(c)+2)))
     return buf.getvalue()
 
-f=st.file_uploader('Cargar BASE_MAESTRA_RCN_ACTUALIZADA.xlsx generada por Data Factory V9',type=['xlsx'])
+st.info('📌 Esta aplicación requiere la Base Maestra **V9** generada con la aplicación **Data Factory V9**. Una Base Maestra V8 o anterior no contiene todas las hojas necesarias para la conciliación.')
+f=st.file_uploader('Cargar BASE_MAESTRA_RCN_ACTUALIZADA.xlsx (generada por Data Factory V9)',type=['xlsx'])
 if not f:
-    st.info('Primero genera la base con app (1).py. Luego cárgala aquí para construir el informe.')
+    st.info('Primero ejecuta **app (1).py**, carga DATA RCN, SERVICIO PAT y TRAYECTOS TODOS, y descarga la nueva Base Maestra. Luego cárgala aquí.')
     st.stop()
 try:
-    raw=f.getvalue();book=pd.ExcelFile(io.BytesIO(raw))
-    required=['BASE_SOLICITUDES','BASE_MAESTRA_RCN','REVISION_COORDINADOR']
-    missing=[s for s in required if s not in book.sheet_names]
-    if missing:raise ValueError('Faltan hojas de la Data Factory V9: '+', '.join(missing))
+    raw=f.getvalue()
+    book=pd.ExcelFile(io.BytesIO(raw))
+except Exception as e:
+    st.error('No se pudo abrir el archivo Excel. Verifica que sea un libro .xlsx válido y que no esté dañado.')
+    st.caption(f'Detalle técnico: {e}')
+    st.stop()
+required=['BASE_SOLICITUDES','BASE_MAESTRA_RCN','REVISION_COORDINADOR']
+missing=[name for name in required if name not in book.sheet_names]
+if missing:
+    st.error('**Archivo incompatible: la Base Maestra cargada no corresponde al formato V9.**')
+    st.write('**Hojas encontradas:** '+', '.join(f'`{name}`' for name in book.sheet_names))
+    st.write('**Hojas faltantes:** '+', '.join(f'`{name}`' for name in missing))
+    st.warning('No es posible calcular de forma confiable los resultados finales de PAT, la prioridad de las remesas SEV y las alertas de revisión del coordinador a partir de esta base antigua.')
+    st.markdown('''**Cómo solucionarlo:**
+    1. Abre la aplicación **RCN Data Factory V9** (`app (1).py`).
+    2. Carga los archivos originales **DATA RCN**, **SERVICIO PAT** y **TRAYECTOS TODOS**.
+    3. Descarga el Excel **BASE_MAESTRA_RCN_ACTUALIZADA.xlsx**.
+    4. Regresa aquí y reemplaza el archivo cargado por el Excel recién generado.
+
+    **Importante:** cambiar el nombre de un archivo V8 a V9 no lo convierte; es necesario volver a procesar las tres fuentes.''')
+    st.stop()
+try:
     op=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_SOLICITUDES')
     fin=pd.read_excel(io.BytesIO(raw),sheet_name='BASE_MAESTRA_RCN')
     rev=pd.read_excel(io.BytesIO(raw),sheet_name='REVISION_COORDINADOR')
+    columnas_op=['DATA_FECHA_SERVICIO','DATA_CANCELADO','COINCIDE_PAT','EJECUCION_CONFIRMADA_ASTRANS','DATA_CENTRO_ORDEN_COSTO']
+    columnas_fin=['ASTRANS_FECHA_SERVICIO','ASTRANS_FECHA_CARGA','V_CLIENTE_NUM','V_CONDUCT_NUM','MARGEN_CALCULADO','ES_EJECUCION_VALIDA','ES_ANULADO','ES_CIERRE_PENDIENTE','CENTRO_COSTO_CONCILIADO']
+    faltan_op=[c for c in columnas_op if c not in op.columns]
+    faltan_fin=[c for c in columnas_fin if c not in fin.columns]
+    if faltan_op or faltan_fin:
+        st.error('El archivo tiene las hojas V9, pero faltan columnas obligatorias para el informe.')
+        if faltan_op:st.write('**BASE_SOLICITUDES:** '+', '.join(f'`{c}`' for c in faltan_op))
+        if faltan_fin:st.write('**BASE_MAESTRA_RCN:** '+', '.join(f'`{c}`' for c in faltan_fin))
+        st.info('Vuelve a generar el libro usando la Data Factory V9 incluida en el mismo paquete que este informe.')
+        st.stop()
     for c in ['V_CLIENTE_NUM','V_CONDUCT_NUM','MARGEN_CALCULADO']:
         fin[c]=pd.to_numeric(fin[c],errors='coerce').fillna(0)
     for c in ['DATA_CANCELADO','COINCIDE_PAT','EJECUCION_CONFIRMADA_ASTRANS']:
@@ -82,7 +111,10 @@ try:
     fin=periodos(fin,'ASTRANS_FECHA_SERVICIO')
     fin['MES_CARGA']=pd.to_datetime(fin.ASTRANS_FECHA_CARGA,errors='coerce').dt.strftime('%Y-%m')
 except Exception as e:
-    st.exception(e);st.stop()
+    st.error('No fue posible preparar la Base Maestra V9 para el informe. Comprueba que se haya generado completamente.')
+    with st.expander('Ver detalle técnico'):
+        st.exception(e)
+    st.stop()
 
 # Los filtros se aplican sobre la misma llave de servicio o sobre el centro conciliado.
 with st.sidebar:
