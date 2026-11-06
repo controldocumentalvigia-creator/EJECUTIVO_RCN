@@ -506,6 +506,21 @@ if legacy:
     fin['FUENTE_CENTRO_COSTO']='NO_CONCILIADO_HISTORICO'
     fin['RESULTADO_SERVICIO']='HISTORICO_SIN_VALIDAR'
     fin['ESTADO_TRAZABILIDAD']='NO_VALIDADO'
+# Compatibilidad con Bases Maestras que traen PAT conciliado pero no DETALLE_PAT.
+# Nunca inferir cancelaciones PAT de DATA: solo de columnas PAT verificables.
+pat_reconstruido=False
+if not legacy and pat_detalle.empty and {'LLAVE_DATA_PAT','PAT_REGISTROS','PAT_TIENE_SEV','PAT_CANCELADO'}.issubset(op.columns):
+    registros=pd.to_numeric(op['PAT_REGISTROS'],errors='coerce')
+    reconstruible=op.loc[registros.notna()].copy()
+    if not reconstruible.empty:
+        pat_detalle=pd.DataFrame({
+            'LLAVE_DATA_PAT':reconstruible['LLAVE_DATA_PAT'],
+            'PAT_FECHA_SERVICIO':pd.to_datetime(reconstruible['DATA_FECHA_SERVICIO'],errors='coerce',dayfirst=True),
+            'PAT_TIENE_SEV':reconstruible['PAT_TIENE_SEV'],
+            'PAT_CANCELADO':reconstruible['PAT_CANCELADO'],
+            'PAT_CENTRO_ORDEN_COSTO':reconstruible['DATA_CENTRO_ORDEN_COSTO'],
+        })
+        pat_reconstruido=True
 if legacy:pat_detalle=pd.DataFrame()
 for c in ['DATA_CANCELADO','EJECUCION_CONFIRMADA_ASTRANS','PAT_TIENE_SEV']:
     op[c]=boolean(op[c]) if c in op else False
@@ -594,24 +609,41 @@ for m in ['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA','CANCELADAS_FINALES','CO
     op_mes['VAR_'+m+'_%']=op_mes[m].pct_change(fill_method=None)*100
 op_mes['TASA_CANCEL_DATA_%']=np.where(op_mes.SOLICITUDES>0,op_mes.CANCELADAS_DATA/op_mes.SOLICITUDES*100,0)
 op_mes['TASA_CANCEL_FINAL_%']=np.where(op_mes.SOLICITUDES>0,op_mes.CANCELADAS_FINALES/op_mes.SOLICITUDES*100,0)
-# Resumen PAT con deduplicación por solicitud. Estados contradictorios: gana SEV.
+# Comparación DATA inicial / PAT real: misma cohorte de solicitudes DATA (fecha + orden).
+# Se muestran N/D en meses fuera de cobertura PAT; no se imputan ceros.
 if not pat_detalle.empty:
     pat_solicitudes=(pat_detalle.groupby('LLAVE_DATA_PAT',as_index=False)
         .agg(PAT_FECHA_SERVICIO=('PAT_FECHA_SERVICIO','min'),
              PAT_TIENE_SEV=('PAT_TIENE_SEV','max'),
              PAT_CANCELADO=('PAT_CANCELADO','max'),
              PAT_FILAS=('LLAVE_DATA_PAT','size')))
-    pat_solicitudes=periodo(pat_solicitudes,'PAT_FECHA_SERVICIO')
+    pat_solicitudes['PAT_TIENE_SEV']=boolean(pat_solicitudes['PAT_TIENE_SEV'])
+    pat_solicitudes['PAT_CANCELADO']=boolean(pat_solicitudes['PAT_CANCELADO'])
     pat_solicitudes['PAT_CANCELADO_FINAL']=pat_solicitudes.PAT_CANCELADO & ~pat_solicitudes.PAT_TIENE_SEV
     pat_solicitudes['PAT_GESTIONADO']=pat_solicitudes.PAT_TIENE_SEV
     pat_solicitudes['PAT_PENDIENTE']=~pat_solicitudes.PAT_TIENE_SEV & ~pat_solicitudes.PAT_CANCELADO_FINAL
-    pat_mes=(pat_solicitudes.groupby(pcol,as_index=False)
-        .agg(GESTIONADOS_PAT=('PAT_GESTIONADO','sum'),CANCELADOS_PAT=('PAT_CANCELADO_FINAL','sum'),
-             TOTAL_PAT=('LLAVE_DATA_PAT','size'),CON_SEV_PAT=('PAT_TIENE_SEV','sum'),PENDIENTES_PAT=('PAT_PENDIENTE','sum'))
-        .rename(columns={pcol:'PERIODO'}))
+    # PAT puede tener registros no vinculados: se informan, pero no se comparan como si fueran DATA.
+    pat_llaves=set(pat_solicitudes.LLAVE_DATA_PAT)
+    cobertura_meses=set(pd.to_datetime(pat_detalle.PAT_FECHA_SERVICIO,errors='coerce').dt.strftime('%Y-%m').dropna())
+    cohortes=op[['LLAVE_DATA_PAT','DATA_FECHA_SERVICIO']].drop_duplicates('LLAVE_DATA_PAT').copy()
+    cohortes=periodo(cohortes,'DATA_FECHA_SERVICIO')
+    cohortes=cohortes.merge(pat_solicitudes[['LLAVE_DATA_PAT','PAT_GESTIONADO','PAT_CANCELADO_FINAL','PAT_PENDIENTE']],on='LLAVE_DATA_PAT',how='left',validate='one_to_one')
+    cohortes['PAT_VINCULADO']=cohortes.LLAVE_DATA_PAT.isin(pat_llaves)
+    pat_mes=(cohortes.groupby(pcol,as_index=False).agg(
+        GESTIONADOS_PAT=('PAT_GESTIONADO',lambda x:int(x.fillna(False).sum())),
+        CANCELADOS_PAT=('PAT_CANCELADO_FINAL',lambda x:int(x.fillna(False).sum())),
+        PENDIENTES_PAT=('PAT_PENDIENTE',lambda x:int(x.fillna(False).sum())),
+        TOTAL_PAT=('PAT_VINCULADO','sum')).rename(columns={pcol:'PERIODO'}))
+    # Cobertura por mes fuente PAT; en bimestres/trimestres, exigir cobertura de los meses
+    # seleccionados dentro de ese periodo, sin crear resultados artificiales.
+    meses_por_periodo=op.groupby(pcol)['MES'].apply(lambda x:set(x.dropna().astype(str)))
+    periodos_cubiertos={k for k,v in meses_por_periodo.items() if v and v.issubset(cobertura_meses)}
+    for campo in ['GESTIONADOS_PAT','CANCELADOS_PAT','PENDIENTES_PAT','TOTAL_PAT']:
+        pat_mes.loc[~pat_mes.PERIODO.isin(periodos_cubiertos),campo]=np.nan
+    pat_mes['CON_SEV_PAT']=pat_mes.GESTIONADOS_PAT
 else:
     pat_mes=pd.DataFrame(columns=['PERIODO','GESTIONADOS_PAT','CANCELADOS_PAT','TOTAL_PAT','CON_SEV_PAT','PENDIENTES_PAT'])
-comparativo_pat=op_mes[['PERIODO','SOLICITUDES','CANCELADAS_DATA']].merge(pat_mes,on='PERIODO',how='outer').sort_values('PERIODO')
+comparativo_pat=op_mes[['PERIODO','SOLICITUDES','CANCELADAS_DATA']].merge(pat_mes,on='PERIODO',how='left').sort_values('PERIODO')
 comparativo_pat['VAR_CANCELACIONES_DATA_%']=comparativo_pat.CANCELADAS_DATA.pct_change(fill_method=None)*100
 comparativo_pat['VAR_CANCELACIONES_PAT_%']=comparativo_pat.CANCELADOS_PAT.pct_change(fill_method=None)*100
 comparativo_pat['TASA_CANCELACION_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.CANCELADOS_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
@@ -656,6 +688,8 @@ with tabs[3]:
         st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS','CANCELADAS_FINALES'],'Remesa PAT, ejecución conciliada y cancelaciones'),use_container_width=True)
         st.dataframe(op.groupby('ESTADO_FINAL_SOLICITUD',dropna=False).size().reset_index(name='CANTIDAD'),hide_index=True,use_container_width=True)
 with tabs[4]:
+    if comparativo_pat.CANCELADOS_PAT.notna().sum()==0:
+        st.warning('No hay cancelaciones PAT verificables para estos meses. Las barras DATA son iniciales; no representan cancelaciones reales.')
     c1,c2=st.columns(2)
     with c1:
         st.plotly_chart(barras_comparativas_con_variacion(
@@ -679,10 +713,11 @@ with tabs[4]:
     st.dataframe(tabla_cancel.style.format({'TASA_CANCELACION_PAT_%':lambda x:pct_plain(x),'VAR_INICIAL_%':lambda x:pct(x),'VAR_REAL_PAT_%':lambda x:pct(x)},na_rep='N/D'),hide_index=True,use_container_width=True)
 with tabs[5]:
     st.subheader('Solicitudes DATA vs gestionados y cancelados PAT')
-    st.caption('Solicitados: filas originales DATA. Gestionados PAT: órdenes únicas con remesa SEV; pendientes sin SEV ni cancelación confirmada se reportan aparte. Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. Las fuentes tienen coberturas distintas.')
-    if pat_mes.empty:
-        st.warning('Esta Base Maestra no contiene DETALLE_PAT. Genera la Base Maestra con Data Factory actualizada o carga las tres fuentes originales para ver el resultado PAT.')
+    st.caption('Solicitados: filas originales DATA. Gestionados PAT: órdenes únicas con remesa SEV; pendientes sin SEV ni cancelación confirmada se reportan aparte. Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. La comparación usa la misma cohorte DATA (fecha + orden) y solo meses con cobertura PAT.')
+    if pat_mes.empty or comparativo_pat.CANCELADOS_PAT.notna().sum()==0:
+        st.warning('PAT no está disponible para los meses seleccionados. Carga la Base Maestra que incluye DETALLE_PAT o los tres originales. Los meses sin PAT son N/D.')
     else:
+        if pat_reconstruido:st.info('PAT recuperado de columnas conciliadas de BASE_SOLICITUDES. Para auditoría detallada, vuelve a exportar desde Data Factory con DETALLE_PAT.')
         fig=go.Figure()
         for campo,nombre,color in [('SOLICITUDES','Solicitudes iniciales DATA','#003B75'),('GESTIONADOS_PAT','Gestionados PAT','#008A3D'),('CANCELADOS_PAT','Cancelados PAT','#D43D3D')]:
             fig.add_bar(x=comparativo_pat.PERIODO,y=comparativo_pat[campo],name=nombre,marker_color=color,
@@ -700,20 +735,24 @@ with tabs[5]:
         st.info('Si PAT registra una remesa SEV y también un estado Cancelado, se contabiliza como gestionado y se conserva la alerta para revisión del coordinador. La cobertura PAT comienza en junio para los archivos suministrados.')
 with tabs[6]:
     st.subheader('Evolución de la producción operativa: cantidades y variaciones')
-    evolucion=op_mes[['PERIODO','SOLICITUDES','GESTIONADAS','CANCELADAS_DATA']].copy()
-    for campo in ['SOLICITUDES','GESTIONADAS','CANCELADAS_DATA']:
+    evolucion=comparativo_pat[['PERIODO','SOLICITUDES','GESTIONADOS_PAT','CANCELADAS_DATA','CANCELADOS_PAT']].copy()
+    for campo in ['SOLICITUDES','GESTIONADOS_PAT','CANCELADAS_DATA','CANCELADOS_PAT']:
         evolucion['VAR_'+campo+'_%']=evolucion[campo].pct_change(fill_method=None)*100
     fig_evol=go.Figure()
-    for campo,nombre,color in [('SOLICITUDES','Solicitudes DATA','#5CAEF5'),('GESTIONADAS','Gestión inicial DATA','#003B75'),('CANCELADAS_DATA','Canceladas DATA','#D43D3D')]:
+    for campo,nombre,color in [('SOLICITUDES','Solicitudes iniciales DATA','#5CAEF5'),
+                               ('GESTIONADOS_PAT','Gestionados reales PAT (SEV)','#008A3D'),
+                               ('CANCELADAS_DATA','Cancelaciones iniciales DATA','#003B75'),
+                               ('CANCELADOS_PAT','Cancelaciones reales PAT','#D43D3D')]:
         var=evolucion['VAR_'+campo+'_%']
-        textos=[f'{fmt(n)}<br>{"Base" if pd.isna(v) else pct(v)}' for n,v in zip(evolucion[campo],var)]
+        textos=[('' if pd.isna(n) else f'{fmt(n)}<br>{"Base" if pd.isna(v) else pct(v)}') for n,v in zip(evolucion[campo],var)]
         fig_evol.add_scatter(x=evolucion.PERIODO,y=evolucion[campo],name=nombre,mode='lines+markers+text',
             text=textos,textposition='top center',textfont=dict(size=10,color='#172B4D'),
             line=dict(color=color,width=3),marker=dict(size=9),cliponaxis=False)
-    estilo(fig_evol,'Evolución mensual: cantidad y variación respecto al periodo anterior',600)
-    ejes_meses(fig_evol,evolucion,'PERIODO');fig_evol.update_layout(margin=dict(l=60,r=45,t=80,b=70))
+    estilo(fig_evol,'Evolución mensual: DATA inicial vs resultado PAT real',620)
+    ejes_meses(fig_evol,evolucion,'PERIODO');fig_evol.update_layout(margin=dict(l=60,r=45,t=85,b=70))
     st.plotly_chart(fig_evol,use_container_width=True)
-    st.dataframe(evolucion.style.format({c:lambda x:pct(x) for c in evolucion if c.startswith('VAR_')},na_rep='Base'),hide_index=True,use_container_width=True)
+    st.caption('PAT es el resultado real, no la gestión inicial DATA. Los meses sin cobertura PAT se muestran como N/D.')
+    st.dataframe(evolucion.style.format({c:lambda x:pct(x) for c in evolucion if c.startswith('VAR_')},na_rep='N/D'),hide_index=True,use_container_width=True)
     if not legacy:st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS'],'SEV y ejecución conciliada'),use_container_width=True)
     st.plotly_chart(barras(fin_mes,'PERIODO','REMESAS','Remesas ejecutadas y variación'),use_container_width=True)
     st.dataframe(op_mes,hide_index=True,use_container_width=True)
@@ -731,8 +770,16 @@ with tabs[8]:
     if not evol.empty:
         malla=pd.MultiIndex.from_product([sorted(op.MES.dropna().unique()),list(top)],names=['MES','DATA_CENTRO_ORDEN_COSTO']).to_frame(index=False)
         evol=malla.merge(evol,on=['MES','DATA_CENTRO_ORDEN_COSTO'],how='left').fillna({'SOLICITUDES':0})
-        fig=px.line(evol,x='MES',y='SOLICITUDES',color='DATA_CENTRO_ORDEN_COSTO',markers=True,title='Evolución mensual por centro de costo (top 12)')
-        estilo(fig,'Evolución mensual por centro de costo (top 12)',580);ejes_meses(fig,evol,'MES');st.plotly_chart(fig,use_container_width=True)
+        fig=px.line(evol,x='MES',y='SOLICITUDES',color='DATA_CENTRO_ORDEN_COSTO',markers=True,
+                    text='SOLICITUDES',title='Evolución mensual por centro de costo (top 12)')
+        fig.update_traces(mode='lines+markers+text',textposition='top center',
+                          textfont=dict(size=10,color='#172B4D'),cliponaxis=False)
+        # Cero se mantiene en la tabla; ocultar solo su etiqueta para reducir ruido visual.
+        for tr in fig.data:
+            tr.text=['' if float(v)==0 else fmt(v) for v in tr.y]
+        estilo(fig,'Evolución mensual por centro de costo (top 12)',640)
+        fig.update_layout(legend=dict(orientation='h',y=-0.24,x=0,font=dict(size=10)),margin=dict(l=55,r=35,t=80,b=155))
+        ejes_meses(fig,evol,'MES');st.plotly_chart(fig,use_container_width=True)
     st.subheader('Tabla de evolución por producción — incluye meses con cero solicitudes')
     st.caption('0 = ninguna solicitud registrada para esa producción en el mes; no significa necesariamente que se perdió el cliente.')
     tabla_centros=tabla_mensual_completa(op,'MES','DATA_CENTRO_ORDEN_COSTO','SOLICITUDES',sorted(op.MES.dropna().unique()),top=20)
