@@ -91,7 +91,7 @@ def preparar_pat(raw, hoja):
     p['PAT_FECHA_SERVICIO'] = dates(values(raw, 'Fecha Servicio'))
     p['PAT_ORDEN_SERVICIO'] = values(raw, 'No. Orden Servicio', 'SERVICIO', 'No.OrdenServicio').astype(str).str.strip()
     p['PAT_REMESAS_ORIGINAL'] = values(raw, 'REMESAS', 'REMESA').fillna('').astype(str).str.strip()
-    p['PAT_ESTADO'] = values(raw, 'Estado').fillna('').astype(str).str.strip()
+    p['PAT_ESTADO'] = values(raw, 'Estado Servicio', 'Estado').fillna('').astype(str).str.strip()
     p['PAT_CENTRO_ORDEN_COSTO'] = values(raw, 'Centro / Orden Costo').fillna('').astype(str).str.strip()
     p['PAT_ORIGEN'] = values(raw, 'ORIGEN').fillna('').astype(str).str.strip()
     p['PAT_DESTINO'] = values(raw, 'DESTINO').fillna('').astype(str).str.strip()
@@ -643,7 +643,35 @@ if not pat_detalle.empty:
     pat_mes['CON_SEV_PAT']=pat_mes.GESTIONADOS_PAT
 else:
     pat_mes=pd.DataFrame(columns=['PERIODO','GESTIONADOS_PAT','CANCELADOS_PAT','TOTAL_PAT','CON_SEV_PAT','PENDIENTES_PAT'])
+# Auditoría independiente PAT: no descartar cancelaciones por ausencia de coincidencia DATA.
+# Agrupar fecha+orden antes de contar; SEV prevalece ante cancelación contradictoria.
+if not pat_detalle.empty:
+    auditoria_pat=pat_detalle.groupby('LLAVE_DATA_PAT',as_index=False).agg(
+        PAT_FECHA_SERVICIO=('PAT_FECHA_SERVICIO','min'),
+        PAT_TIENE_SEV=('PAT_TIENE_SEV','max'),
+        PAT_CANCELADO=('PAT_CANCELADO','max'))
+    auditoria_pat['PAT_CANCELADO_REAL']=boolean(auditoria_pat.PAT_CANCELADO) & ~boolean(auditoria_pat.PAT_TIENE_SEV)
+    auditoria_pat['COINCIDE_DATA']=auditoria_pat.LLAVE_DATA_PAT.isin(set(op.LLAVE_DATA_PAT))
+    auditoria_pat=periodo(auditoria_pat,'PAT_FECHA_SERVICIO')
+    pat_audit_mes=auditoria_pat.groupby(pcol,as_index=False).agg(
+        CANCELADOS_PAT_REGISTRADOS=('PAT_CANCELADO_REAL','sum'),
+        CANCELADOS_PAT_SIN_DATA=('PAT_CANCELADO_REAL',lambda x:int((x & ~auditoria_pat.loc[x.index,'COINCIDE_DATA']).sum())),
+        ORDENES_PAT=('LLAVE_DATA_PAT','size')).rename(columns={pcol:'PERIODO'})
+else:
+    pat_audit_mes=pd.DataFrame(columns=['PERIODO','CANCELADOS_PAT_REGISTRADOS','CANCELADOS_PAT_SIN_DATA','ORDENES_PAT'])
 comparativo_pat=op_mes[['PERIODO','SOLICITUDES','CANCELADAS_DATA']].merge(pat_mes,on='PERIODO',how='left').sort_values('PERIODO')
+comparativo_pat=comparativo_pat.merge(pat_audit_mes,on='PERIODO',how='left')
+# PAT fuera de cobertura es N/D; PAT con cobertura y cero cancelaciones es 0.
+if not pat_detalle.empty:
+    cobertura_pat=set(pat_detalle.MES.dropna().astype(str))
+    meses_periodo=op.groupby(pcol)['MES'].agg(lambda x:set(x.dropna().astype(str))).to_dict()
+    for ix,row in comparativo_pat.iterrows():
+        ms=meses_periodo.get(row.PERIODO,set())
+        if not ms or not ms.issubset(cobertura_pat):
+            comparativo_pat.loc[ix,['CANCELADOS_PAT_REGISTRADOS','CANCELADOS_PAT_SIN_DATA','ORDENES_PAT']]=np.nan
+        elif pd.isna(row.CANCELADOS_PAT_REGISTRADOS):
+            comparativo_pat.loc[ix,['CANCELADOS_PAT_REGISTRADOS','CANCELADOS_PAT_SIN_DATA','ORDENES_PAT']]=0
+
 comparativo_pat['VAR_CANCELACIONES_DATA_%']=comparativo_pat.CANCELADAS_DATA.pct_change(fill_method=None)*100
 comparativo_pat['VAR_CANCELACIONES_PAT_%']=comparativo_pat.CANCELADOS_PAT.pct_change(fill_method=None)*100
 comparativo_pat['TASA_CANCELACION_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.CANCELADOS_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
@@ -688,27 +716,29 @@ with tabs[3]:
         st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS','CANCELADAS_FINALES'],'Remesa PAT, ejecución conciliada y cancelaciones'),use_container_width=True)
         st.dataframe(op.groupby('ESTADO_FINAL_SOLICITUD',dropna=False).size().reset_index(name='CANTIDAD'),hide_index=True,use_container_width=True)
 with tabs[4]:
-    if comparativo_pat.CANCELADOS_PAT.notna().sum()==0:
-        st.warning('No hay cancelaciones PAT verificables para estos meses. Las barras DATA son iniciales; no representan cancelaciones reales.')
+    if comparativo_pat.CANCELADOS_PAT_REGISTRADOS.notna().sum()==0:
+        st.warning('No hay datos PAT para los meses seleccionados en la Base Maestra cargada. Usa la Base Maestra CON PAT o carga SERVICIO PAT original junto con las otras fuentes.')
+    else:
+        st.caption('PAT registradas: cancelaciones finales sin SEV, por fecha y orden únicas. PAT conciliadas: subconjunto vinculado con DATA. Las diferencias se muestran para auditoría.')
     c1,c2=st.columns(2)
     with c1:
         st.plotly_chart(barras_comparativas_con_variacion(
-            comparativo_pat,[('CANCELADAS_DATA','Cancelaciones iniciales DATA'),('CANCELADOS_PAT','Cancelaciones reales PAT')],
+            comparativo_pat,[('CANCELADAS_DATA','Cancelaciones iniciales DATA'),('CANCELADOS_PAT_REGISTRADOS','Cancelaciones reales PAT')],
             'Cancelaciones iniciales vs reales y variación mensual'),use_container_width=True)
     with c2:
         st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%'],'Tasa de cancelación inicial DATA (%)',porcentaje=True),use_container_width=True)
-    if not pat_mes.empty and comparativo_pat.CANCELADOS_PAT.notna().any():
-        st.plotly_chart(linea(comparativo_pat,'PERIODO',['CANCELADAS_DATA','CANCELADOS_PAT'],'Tendencia de cancelaciones: DATA inicial vs PAT final'),use_container_width=True)
+    if not pat_mes.empty and comparativo_pat.CANCELADOS_PAT_REGISTRADOS.notna().any():
+        st.plotly_chart(linea(comparativo_pat,'PERIODO',['CANCELADAS_DATA','CANCELADOS_PAT_REGISTRADOS'],'Tendencia de cancelaciones: DATA inicial vs PAT real'),use_container_width=True)
     else:
         st.warning('Sin detalle PAT disponible: las cancelaciones finales PAT son N/D, no cero.')
     if not legacy:
         st.plotly_chart(comparativo_barras(op_mes,[('CANCELADAS_DATA','Canceladas inicialmente DATA'),('CANCELADAS_FINALES','Canceladas finales conciliadas')],'Seguimiento de cancelaciones iniciales vs finales'),use_container_width=True)
         st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%','TASA_CANCEL_FINAL_%'],'Evolución de tasas de cancelación (%)',porcentaje=True),use_container_width=True)
         st.plotly_chart(pareto(op[op.ES_CANCELACION_FINAL],'DATA_CENTRO_ORDEN_COSTO','Pareto de cancelaciones finales por centro'),use_container_width=True)
-    tabla_cancel=comparativo_pat[['PERIODO','SOLICITUDES','CANCELADAS_DATA','CANCELADOS_PAT','TASA_CANCELACION_PAT_%']].copy()
+    tabla_cancel=comparativo_pat[['PERIODO','SOLICITUDES','CANCELADAS_DATA','CANCELADOS_PAT_REGISTRADOS','CANCELADOS_PAT','CANCELADOS_PAT_SIN_DATA','TASA_CANCELACION_PAT_%']].copy()
     tabla_cancel['VAR_INICIAL_%']=tabla_cancel.CANCELADAS_DATA.pct_change(fill_method=None)*100
-    tabla_cancel['VAR_REAL_PAT_%']=tabla_cancel.CANCELADOS_PAT.pct_change(fill_method=None)*100
-    tabla_cancel['DIFERENCIA_PAT_MENOS_DATA']=tabla_cancel.CANCELADOS_PAT-tabla_cancel.CANCELADAS_DATA
+    tabla_cancel['VAR_REAL_PAT_%']=tabla_cancel.CANCELADOS_PAT_REGISTRADOS.pct_change(fill_method=None)*100
+    tabla_cancel['DIFERENCIA_PAT_MENOS_DATA']=tabla_cancel.CANCELADOS_PAT_REGISTRADOS-tabla_cancel.CANCELADAS_DATA
     st.caption('PAT sin cobertura se muestra N/D, no como cero. SEV prevalece sobre Cancelado; diferencias no significan necesariamente incumplimientos.')
     st.dataframe(tabla_cancel.style.format({'TASA_CANCELACION_PAT_%':lambda x:pct_plain(x),'VAR_INICIAL_%':lambda x:pct(x),'VAR_REAL_PAT_%':lambda x:pct(x)},na_rep='N/D'),hide_index=True,use_container_width=True)
 with tabs[5]:
@@ -738,20 +768,33 @@ with tabs[6]:
     evolucion=comparativo_pat[['PERIODO','SOLICITUDES','GESTIONADOS_PAT','CANCELADAS_DATA','CANCELADOS_PAT']].copy()
     for campo in ['SOLICITUDES','GESTIONADOS_PAT','CANCELADAS_DATA','CANCELADOS_PAT']:
         evolucion['VAR_'+campo+'_%']=evolucion[campo].pct_change(fill_method=None)*100
-    fig_evol=go.Figure()
-    for campo,nombre,color in [('SOLICITUDES','Solicitudes iniciales DATA','#5CAEF5'),
-                               ('GESTIONADOS_PAT','Gestionados reales PAT (SEV)','#008A3D'),
-                               ('CANCELADAS_DATA','Cancelaciones iniciales DATA','#003B75'),
-                               ('CANCELADOS_PAT','Cancelaciones reales PAT','#D43D3D')]:
-        var=evolucion['VAR_'+campo+'_%']
-        textos=[('' if pd.isna(n) else f'{fmt(n)}<br>{"Base" if pd.isna(v) else pct(v)}') for n,v in zip(evolucion[campo],var)]
-        fig_evol.add_scatter(x=evolucion.PERIODO,y=evolucion[campo],name=nombre,mode='lines+markers+text',
-            text=textos,textposition='top center',textfont=dict(size=10,color='#172B4D'),
-            line=dict(color=color,width=3),marker=dict(size=9),cliponaxis=False)
-    estilo(fig_evol,'Evolución mensual: DATA inicial vs resultado PAT real',620)
-    ejes_meses(fig_evol,evolucion,'PERIODO');fig_evol.update_layout(margin=dict(l=60,r=45,t=85,b=70))
-    st.plotly_chart(fig_evol,use_container_width=True)
-    st.caption('PAT es el resultado real, no la gestión inicial DATA. Los meses sin cobertura PAT se muestran como N/D.')
+    st.caption('Dos diagramas de barras agrupadas para que las cantidades pequeñas de cancelaciones no queden ocultas por las solicitudes. Los meses sin cobertura PAT se mantienen como N/D.')
+    def barras_evolucion(datos, series, titulo, altura=460):
+        fig=go.Figure()
+        for campo,nombre,color in series:
+            valores=pd.to_numeric(datos[campo],errors='coerce')
+            cambios=datos['VAR_'+campo+'_%']
+            etiquetas=[('' if pd.isna(v) else fmt(v)) for v in valores]
+            variaciones=[('N/D' if pd.isna(v) else pct(v)) for v in cambios]
+            fig.add_trace(go.Bar(
+                x=datos.PERIODO,y=valores,name=nombre,marker_color=color,
+                text=etiquetas,textposition='outside',cliponaxis=False,
+                customdata=variaciones,
+                hovertemplate='%{x}<br>'+nombre+': %{y:,.0f}<br>Variación: %{customdata}<extra></extra>'))
+        estilo(fig,titulo,altura)
+        ejes_meses(fig,datos,'PERIODO')
+        fig.update_layout(barmode='group',uniformtext_minsize=10,uniformtext_mode='show',
+                          margin=dict(l=55,r=35,t=85,b=80),
+                          legend=dict(orientation='h',yanchor='bottom',y=1.03,xanchor='left',x=0))
+        fig.update_yaxes(rangemode='tozero')
+        return fig
+    st.plotly_chart(barras_evolucion(evolucion,[
+        ('SOLICITUDES','Solicitudes iniciales DATA','#2678C9'),
+        ('GESTIONADOS_PAT','Servicios reales PAT (SEV)','#008A3D'),
+        ('CANCELADAS_DATA','Cancelaciones iniciales DATA','#E8A32A'),
+        ('CANCELADOS_PAT','Cancelaciones reales PAT','#D43D3D')],
+        'Comparativo mensual: solicitudes, servicios reales y cancelaciones'),use_container_width=True)
+    st.caption('Cuatro barras por mes: DATA representa la solicitud inicial y PAT el resultado real. Los valores PAT sin información se muestran N/D, no cero. Cada barra indica cantidad y la variación se consulta al pasar el cursor.')
     st.dataframe(evolucion.style.format({c:lambda x:pct(x) for c in evolucion if c.startswith('VAR_')},na_rep='N/D'),hide_index=True,use_container_width=True)
     if not legacy:st.plotly_chart(linea(op_mes,'PERIODO',['CON_SEV_PAT','EJECUTADAS_CONCILIADAS'],'SEV y ejecución conciliada'),use_container_width=True)
     st.plotly_chart(barras(fin_mes,'PERIODO','REMESAS','Remesas ejecutadas y variación'),use_container_width=True)
