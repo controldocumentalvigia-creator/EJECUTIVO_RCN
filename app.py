@@ -604,7 +604,7 @@ if not pat_detalle.empty:
     pat_solicitudes=periodo(pat_solicitudes,'PAT_FECHA_SERVICIO')
     pat_solicitudes['PAT_CANCELADO_FINAL']=pat_solicitudes.PAT_CANCELADO & ~pat_solicitudes.PAT_TIENE_SEV
     pat_solicitudes['PAT_GESTIONADO']=pat_solicitudes.PAT_TIENE_SEV
-    pat_solicitudes['PAT_PENDIENTE']=~pat_solicitudes.PAT_TIENE_SEV & ~pat_solicitudes.PAT_CANCELADO
+    pat_solicitudes['PAT_PENDIENTE']=~pat_solicitudes.PAT_TIENE_SEV & ~pat_solicitudes.PAT_CANCELADO_FINAL
     pat_mes=(pat_solicitudes.groupby(pcol,as_index=False)
         .agg(GESTIONADOS_PAT=('PAT_GESTIONADO','sum'),CANCELADOS_PAT=('PAT_CANCELADO_FINAL','sum'),
              TOTAL_PAT=('LLAVE_DATA_PAT','size'),CON_SEV_PAT=('PAT_TIENE_SEV','sum'),PENDIENTES_PAT=('PAT_PENDIENTE','sum'))
@@ -612,8 +612,8 @@ if not pat_detalle.empty:
 else:
     pat_mes=pd.DataFrame(columns=['PERIODO','GESTIONADOS_PAT','CANCELADOS_PAT','TOTAL_PAT','CON_SEV_PAT','PENDIENTES_PAT'])
 comparativo_pat=op_mes[['PERIODO','SOLICITUDES','CANCELADAS_DATA']].merge(pat_mes,on='PERIODO',how='outer').sort_values('PERIODO')
-comparativo_pat['VAR_CANCELADAS_DATA_%']=comparativo_pat.CANCELADAS_DATA.pct_change(fill_method=None)*100
-comparativo_pat['VAR_CANCELADOS_PAT_%']=comparativo_pat.CANCELADOS_PAT.pct_change(fill_method=None)*100
+comparativo_pat['VAR_CANCELACIONES_DATA_%']=comparativo_pat.CANCELADAS_DATA.pct_change(fill_method=None)*100
+comparativo_pat['VAR_CANCELACIONES_PAT_%']=comparativo_pat.CANCELADOS_PAT.pct_change(fill_method=None)*100
 comparativo_pat['TASA_CANCELACION_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.CANCELADOS_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
 comparativo_pat['COBERTURA_PAT_%']=np.where(comparativo_pat.SOLICITUDES.gt(0),comparativo_pat.TOTAL_PAT/comparativo_pat.SOLICITUDES*100,np.nan)
 fin_mes=fin_unico.groupby(pcol,as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum')).rename(columns={pcol:'PERIODO'}).sort_values('PERIODO')
@@ -663,11 +663,11 @@ with tabs[4]:
             'Cancelaciones iniciales vs reales y variación mensual'),use_container_width=True)
     with c2:
         st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%'],'Tasa de cancelación inicial DATA (%)',porcentaje=True),use_container_width=True)
+    if not pat_mes.empty and comparativo_pat.CANCELADOS_PAT.notna().any():
+        st.plotly_chart(linea(comparativo_pat,'PERIODO',['CANCELADAS_DATA','CANCELADOS_PAT'],'Tendencia de cancelaciones: DATA inicial vs PAT final'),use_container_width=True)
+    else:
+        st.warning('Sin detalle PAT disponible: las cancelaciones finales PAT son N/D, no cero.')
     if not legacy:
-        if pat_mes.empty or comparativo_pat.CANCELADOS_PAT.notna().sum()==0:
-            st.warning('No se detectaron registros PAT para este comparativo. La serie PAT es N/D, no cero. Revisa DETALLE_PAT y los filtros.')
-        else:
-            st.plotly_chart(linea(comparativo_pat,'PERIODO',['CANCELADAS_DATA','CANCELADOS_PAT'],'Tendencia: cancelaciones iniciales DATA frente a finales PAT'),use_container_width=True)
         st.plotly_chart(comparativo_barras(op_mes,[('CANCELADAS_DATA','Canceladas inicialmente DATA'),('CANCELADAS_FINALES','Canceladas finales conciliadas')],'Seguimiento de cancelaciones iniciales vs finales'),use_container_width=True)
         st.plotly_chart(linea(op_mes,'PERIODO',['TASA_CANCEL_DATA_%','TASA_CANCEL_FINAL_%'],'Evolución de tasas de cancelación (%)',porcentaje=True),use_container_width=True)
         st.plotly_chart(pareto(op[op.ES_CANCELACION_FINAL],'DATA_CENTRO_ORDEN_COSTO','Pareto de cancelaciones finales por centro'),use_container_width=True)
@@ -679,7 +679,7 @@ with tabs[4]:
     st.dataframe(tabla_cancel.style.format({'TASA_CANCELACION_PAT_%':lambda x:pct_plain(x),'VAR_INICIAL_%':lambda x:pct(x),'VAR_REAL_PAT_%':lambda x:pct(x)},na_rep='N/D'),hide_index=True,use_container_width=True)
 with tabs[5]:
     st.subheader('Solicitudes DATA vs gestionados y cancelados PAT')
-    st.caption('Solicitados: filas originales DATA. Gestionados PAT: órdenes únicas con remesa SEV. Pendientes PAT se informan por separado y no se cuentan como gestionados. Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. Las fuentes tienen coberturas distintas.')
+    st.caption('Solicitados: filas originales DATA. Gestionados PAT: órdenes únicas con remesa SEV; pendientes sin SEV ni cancelación confirmada se reportan aparte. Cancelados PAT: órdenes únicas canceladas sin SEV. Los meses sin cobertura PAT muestran N/D, nunca cero. Las fuentes tienen coberturas distintas.')
     if pat_mes.empty:
         st.warning('Esta Base Maestra no contiene DETALLE_PAT. Genera la Base Maestra con Data Factory actualizada o carga las tres fuentes originales para ver el resultado PAT.')
     else:
@@ -696,7 +696,7 @@ with tabs[5]:
         st.plotly_chart(linea(comparativo_pat,'PERIODO',['TASA_CANCELACION_PAT_%'],
                              'Cancelaciones finales PAT / solicitudes DATA (%)',porcentaje=True),use_container_width=True)
         st.dataframe(comparativo_pat,hide_index=True,use_container_width=True)
-        st.caption('PENDIENTES_PAT: solicitudes sin SEV ni cancelación confirmada; no se suman a gestionados.')
+        st.caption('PENDIENTES_PAT no se incluyen en GESTIONADOS_PAT. Los meses sin PAT permanecen como N/D.')
         st.info('Si PAT registra una remesa SEV y también un estado Cancelado, se contabiliza como gestionado y se conserva la alerta para revisión del coordinador. La cobertura PAT comienza en junio para los archivos suministrados.')
 with tabs[6]:
     st.subheader('Evolución de la producción operativa: cantidades y variaciones')
@@ -743,6 +743,36 @@ with tabs[8]:
         st.subheader('Financiero por centro conciliado')
         st.dataframe(fcent.groupby('CENTRO_COSTO_CONCILIADO',as_index=False).agg(REMESAS=('ASTRANS_REMESA_NORM','nunique'),FACTURACION=('V_CLIENTE_NUM','sum'),COSTOS=('V_CONDUCT_NUM','sum'),MARGEN=('MARGEN_CALCULADO','sum')).sort_values('FACTURACION',ascending=False),hide_index=True,use_container_width=True)
     st.caption(f'Remesas únicas sin centro de costo conciliado: {len(fin_unico)-len(fcent)}. No se asignan ingresos a producciones por suposición.')
+    st.subheader('Cierre de producciones por centro de costo — solicitudes y cancelaciones')
+    if not op.empty:
+        centro_mes=(op.groupby(['MES','DATA_CENTRO_ORDEN_COSTO'],dropna=False)
+            .agg(SOLICITUDES=('DATA_CANCELADO','size'),CANCELADAS_INICIALES=('DATA_CANCELADO','sum'),
+                 CANCELADAS_FINALES=('ES_CANCELACION_FINAL','sum'),CON_SEV=('CON_SEV_PAT','sum'),
+                 EJECUTADAS=('EJECUCION_CONFIRMADA_ASTRANS','sum')).reset_index())
+        centro_mes['TASA_CANCELACION_FINAL_%']=np.where(centro_mes.SOLICITUDES.gt(0),
+            centro_mes.CANCELADAS_FINALES/centro_mes.SOLICITUDES*100,0)
+        meses_centro=sorted(op.MES.dropna().unique())
+        centros_centro=sorted(op.DATA_CENTRO_ORDEN_COSTO.dropna().astype(str).unique())
+        if meses_centro and centros_centro:
+            malla=pd.MultiIndex.from_product([meses_centro,centros_centro],names=['MES','DATA_CENTRO_ORDEN_COSTO']).to_frame(index=False)
+            centro_mes=malla.merge(centro_mes,on=['MES','DATA_CENTRO_ORDEN_COSTO'],how='left')
+            cols_c=['SOLICITUDES','CANCELADAS_INICIALES','CANCELADAS_FINALES','CON_SEV','EJECUTADAS','TASA_CANCELACION_FINAL_%']
+            centro_mes[cols_c]=centro_mes[cols_c].fillna(0)
+            centro_mes=centro_mes.sort_values(['DATA_CENTRO_ORDEN_COSTO','MES'])
+            centro_mes['VAR_SOLICITUDES_%']=centro_mes.groupby('DATA_CENTRO_ORDEN_COSTO').SOLICITUDES.pct_change(fill_method=None)*100
+            centro_mes['SIN_SOLICITUDES_EN_MES']=centro_mes.SOLICITUDES.eq(0)
+            st.caption('Sin solicitudes en un mes = producción sin registros DATA ese mes; no confirma por sí solo terminación contractual. Las cancelaciones finales se atribuyen por fecha y orden DATA.')
+            st.dataframe(centro_mes,hide_index=True,use_container_width=True)
+            st.download_button('📥 Descargar seguimiento de cierres por centro (CSV)',centro_mes.to_csv(index=False).encode('utf-8-sig'),file_name='RCN_CIERRE_PRODUCCIONES_CENTROS.csv',mime='text/csv')
+    st.subheader('Cierre administrativo de TRAYECTOS por centro de costo')
+    if not fin.empty:
+        estados=fin.copy()
+        estados['ESTADO_CIERRE']=estados.get('ASTRANS_ESTADO_OPER',pd.Series('',index=estados.index)).fillna('').astype(str)
+        cierre=(estados.groupby(['MES','CENTRO_COSTO_CONCILIADO','ESTADO_CIERRE'],dropna=False)
+            .agg(REGISTROS=('ASTRANS_REMESA_NORM','size'),VALOR_CLIENTE=('V_CLIENTE_NUM','sum')).reset_index())
+        st.dataframe(cierre.sort_values(['MES','CENTRO_COSTO_CONCILIADO','ESTADO_CIERRE']),hide_index=True,use_container_width=True)
+        st.caption('CUMPLIDO = cierre con OC; CUMPLIDO OPERATIVO = prestado pendiente de OC; EN PROGRAMACIÓN y EN TRÁNSITO requieren seguimiento. No se presupone que todo pendiente sea facturable.')
+
 with tabs[9]:
     v=first(fin_unico,['T. VEHICULO','T.VEHICULO','T VEHICULO'])
     m=first(fin_unico,['T.NEGOCIO','TRAY. PROP','LINEA NEG'])
